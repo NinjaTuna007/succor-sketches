@@ -163,10 +163,6 @@ These sketches enable **underwater ranging** by measuring acoustic signal travel
 - Multi-platform time synchronization verification
 - Acoustic ranging system development and debugging
 
-## License
-
-Check with repository owner for licensing information.
-
 ## Contributing
 
 Contributions welcome. Please maintain the timing-critical design philosophy and avoid blocking operations in time-sensitive code paths.
