@@ -22,7 +22,7 @@
 // --------------------- MODE SELECT ---------------------
 // 1 = transmitter mode (PPS triggers modem broadcast)
 // 0 = receiver mode (FLAG rising logs delta_t)
-#define MODE_TRANSMITTER 0
+#define MODE_TRANSMITTER 1
 // -------------------------------------------------------
 
 static constexpr uint8_t  PIN_PPS  = 40;
