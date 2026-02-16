@@ -11,6 +11,40 @@ This repository contains two complementary sketches for underwater acoustic rang
 
 Both sketches support dual-mode operation (transmitter or receiver) configured at compile time.
 
+### General logic: signal path
+
+```mermaid
+flowchart LR
+  subgraph TX["Transmitter side"]
+    TX_UC["TX microcontroller\n(Teensy)"]
+    TX_MODEM["TX modem\n(acoustic)"]
+  end
+  subgraph LINK[" "]
+    ACOUSTIC["acoustic / water\nlink"]
+  end
+  subgraph RX["Receiver side"]
+    RX_MODEM["RX modem\n(acoustic)"]
+    RX_UC["RX microcontroller\n(Teensy)"]
+  end
+
+  TX_UC -->|"PPS-triggered\nUART command"| TX_MODEM
+  TX_MODEM -->|"acoustic burst"| ACOUSTIC
+  ACOUSTIC -->|"received signal"| RX_MODEM
+  RX_MODEM -->|"UART + FLAG"| RX_UC
+  RX_UC -->|"delta_t = FLAG − PPS"| RESULT["timing / range"]
+```
+
+- **TX**: PPS rising edge triggers a command sent over UART to the TX modem; the modem emits an acoustic burst.
+- **RX**: The RX modem receives the burst, drives UART and FLAG; the RX microcontroller measures `delta_t` from its PPS to FLAG.
+
+## Present Sketches
+
+- `hybrid_fullmetal_sketch/hybrid_fullmetal_sketch.ino`: Standalone PPS/FLAG timing logger over USB Serial, no ROS dependency.
+- `hybrid_fullmetal_counter_sketch/hybrid_fullmetal_counter_sketch.ino`: Variant of fullmetal with cycle-counter based timestamping and additional timing diagnostics.
+- `hybrid_tx_rx_microros/hybrid_tx_rx_microros.ino`: micro-ROS-enabled transmitter/receiver sketch that publishes modem and timing data to ROS topics.
+- `dual_squarewave_generator_pwm/dual_squarewave_generator_pwm.ino`: Hardware-PWM dual square-wave generator for low-jitter test signals (frequency floor on selected pins applies).
+- `dual_squarewave_generator_isr/dual_squarewave_generator_isr.ino`: IntervalTimer-ISR dual square-wave generator for low-frequency testing where PWM floor is too high.
+
 ## Hardware Requirements
 
 - **Microcontroller**: Teensy 4.1
