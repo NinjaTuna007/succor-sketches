@@ -34,8 +34,8 @@ flowchart LR
   RX_UC -->|"delta_t = FLAG − PPS"| RESULT["timing / range"]
 ```
 
-- **TX**: PPS rising edge triggers a command sent over UART to the TX modem; the modem emits an acoustic burst.
-- **RX**: The RX modem receives the burst, drives UART and FLAG; the RX microcontroller measures `delta_t` from its PPS to FLAG.
+- **TX**: PPS rising edge triggers a command sent over UART to the TX modem; the modem emits an acoustic signal.
+- **RX**: The RX modem receives the acoustic signal, drives UART and FLAG; the RX microcontroller measures `delta_t` from its PPS to FLAG.
 
 ## Present Sketches
 
