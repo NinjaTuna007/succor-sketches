@@ -104,7 +104,7 @@ static volatile bool     pps_seen = false;
 static volatile bool     pps_tx_pending = false;
 #else
 static constexpr uint32_t PPS_FLAG_COINCIDENT_GUARD_US = 5; // drop FLAG samples too close to PPS (ambiguous ordering)
-static constexpr uint32_t CYCLES_PER_US = (uint32_t)(F_CPU_ACTUAL / 1000000ULL);
+static constexpr uint32_t CYCLES_PER_US = (uint32_t)(F_CPU / 1000000ULL);
 static constexpr uint32_t PPS_FLAG_COINCIDENT_GUARD_CYCLES = PPS_FLAG_COINCIDENT_GUARD_US * CYCLES_PER_US;
 static volatile uint32_t delta_cycles_isr = 0;
 static volatile uint64_t flag_cycle64_isr = 0;
