@@ -24,12 +24,12 @@
 // --------------------- MODE SELECT ---------------------
 // 1 = transmitter mode (PPS triggers modem broadcast)
 // 0 = receiver mode (FLAG rising logs delta_t)
-#define MODE_TRANSMITTER 0
+#define MODE_TRANSMITTER 1
 // -------------------------------------------------------
 
 static constexpr uint8_t  PIN_PPS   = 40;
 static constexpr uint8_t  PIN_FLAG  = 41;
-static constexpr uint8_t  PIN_DIAG  = 42;  // diagnostic: HIGH on PPS, LOW on FLAG (pulse width = PPS→FLAG)
+static constexpr uint8_t  PIN_DIAG  = 39;  // diagnostic: HIGH on PPS, LOW on FLAG (pulse width = PPS→FLAG)
 
 #define MODEM_SERIAL Serial1
 static constexpr uint32_t MODEM_BAUD = 9600;
@@ -104,8 +104,8 @@ static volatile bool     pps_seen = false;
 static volatile bool     pps_tx_pending = false;
 #else
 static constexpr uint32_t PPS_FLAG_COINCIDENT_GUARD_US = 5; // drop FLAG samples too close to PPS (ambiguous ordering)
-static constexpr uint32_t CYCLES_PER_US = (uint32_t)(F_CPU_ACTUAL / 1000000ULL);
-static constexpr uint32_t PPS_FLAG_COINCIDENT_GUARD_CYCLES = PPS_FLAG_COINCIDENT_GUARD_US * CYCLES_PER_US;
+static volatile uint32_t CYCLES_PER_US = (uint32_t)(F_CPU_ACTUAL / 1000000ULL);
+static volatile uint32_t PPS_FLAG_COINCIDENT_GUARD_CYCLES = PPS_FLAG_COINCIDENT_GUARD_US * CYCLES_PER_US;
 static volatile uint32_t delta_cycles_isr = 0;
 static volatile uint64_t flag_cycle64_isr = 0;
 static volatile bool     delta_pending = false;

@@ -33,7 +33,7 @@
 // --------------------- MODE SELECT ---------------------
 // 1 = transmitter mode (PPS triggers modem broadcast)
 // 0 = receiver mode (FLAG rising publishes delta_t)
-#define MODE_TRANSMITTER 0
+#define MODE_TRANSMITTER 1
 // -------------------------------------------------------
 
 // --------------------- TOPIC ROOT ----------------------
@@ -121,18 +121,11 @@ static void require_ok(rcl_ret_t rc, uint8_t blink_stage)
 }
 
 // Build "rooted" topic: out = "<TOPIC_ROOT><suffix>"
-// Example: TOPIC_ROOT="/tx", suffix="/succorfish/msg/sent" -> "/tx/succorfish/msg/sent"
 static void make_topic(char *out, size_t out_sz, const char *suffix)
 {
-  // Ensure suffix starts with '/'
-  if (!suffix || suffix[0] != '/') {
-    die_blink(9);
-  }
+  if (!suffix || suffix[0] != '/') die_blink(9);
   int n = snprintf(out, out_sz, "%s%s", TOPIC_ROOT, suffix);
-  if (n < 0 || (size_t)n >= out_sz) {
-    // topic buffer too small
-    die_blink(8);
-  }
+  if (n < 0 || (size_t)n >= out_sz) die_blink(8);
 }
 
 // --------------------- ISRs ----------------------------
@@ -140,7 +133,6 @@ void isr_pps_rising()
 {
   last_pps_us = micros();
   pps_led_toggle_pending = true;
-
 #if MODE_TRANSMITTER
   pps_tx_pending = true;
 #endif
@@ -151,7 +143,7 @@ void isr_flag_rising()
 {
   const uint32_t now = micros();
   const uint32_t pps = last_pps_us;
-  const uint32_t du  = (uint32_t)(now - pps);  // wrap-safe for uint32 micros()
+  const uint32_t du  = (uint32_t)(now - pps);
   delta_us_isr = (int32_t)du;
   delta_pending = true;
 }
@@ -163,17 +155,15 @@ static inline void publish_string(rcl_publisher_t *pub,
                                   std_msgs__msg__String *msg,
                                   const char *cstr)
 {
-  const size_t cap = msg->data.capacity;          // includes '\0'
+  const size_t cap = msg->data.capacity;
   size_t n = strnlen(cstr, cap - 1);
-
   memcpy(msg->data.data, cstr, n);
   msg->data.data[n] = '\0';
   msg->data.size = n;
-
   (void)rcl_publish(pub, msg, NULL);
 }
 
-// Flush current assembled modem line (if any) as one "received message"
+// Flush current assembled modem line
 static void publish_modem_line_if_any()
 {
   if (modem_len == 0) return;
@@ -182,70 +172,30 @@ static void publish_modem_line_if_any()
   modem_len = 0;
 }
 
-// UART pump: publishes ONLY full lines (CRLF terminated)
-// - '\r' ends the line; '\n' immediately after '\r' is ignored.
-// - If '\n' arrives without a preceding '\r', we also treat it as line end (tolerant).
+// UART pump: publish only full lines
 static void pump_modem_rx_publish_full_lines()
 {
   while (MODEM_SERIAL.available()) {
     char c = (char)MODEM_SERIAL.read();
-
-    // If previous char was CR, ignore a following LF
-    if (saw_cr) {
-      saw_cr = false;
-      if (c == '\n') {
-        continue; // swallow LF
-      }
-      // else: handle as normal (belongs to next line)
-    }
-
-    if (c == '\r') {
-      publish_modem_line_if_any();
-      saw_cr = true;
-      continue;
-    }
-
-    if (c == '\n') {
-      publish_modem_line_if_any();
-      continue;
-    }
-
-    // Accept any byte except CR/LF; clamp if too long (drop overflow bytes until line end)
-    if (modem_len < (LINE_MAX - 1)) {
-      modem_line[modem_len++] = c;
-    }
+    if (saw_cr) { saw_cr = false; if (c == '\n') continue; }
+    if (c == '\r') { publish_modem_line_if_any(); saw_cr = true; continue; }
+    if (c == '\n') { publish_modem_line_if_any(); continue; }
+    if (modem_len < (LINE_MAX - 1)) modem_line[modem_len++] = c;
   }
 }
 
 #if MODE_TRANSMITTER
-// TX mode command. Keep "as-is" (no CRLF unless you include it here explicitly).
-// static const char tx_cmd[] = "$B05Hello";
 static const char tx_cmd[] = "$P007";
 
-// --- JITTER FIX + "contiguous command" enforcement ---
-// Restart Serial1 right before sending + flush().
-// Send the command as ONE write() call (no per-char writes, no gaps).
 static void modem_send_cmd_and_publish(const char *cmd)
 {
   const size_t len = strlen(cmd);
+  if (len == 0 || len >= 128) die_blink(7);
 
-  // Safety: command should be comfortably small to avoid any odd blocking behavior.
-  // (Teensy Serial1 TX buffering is limited; keep commands short.)
-  if (len == 0 || len >= 128) {
-    die_blink(7); // arbitrary blink code for "bad command length"
-  }
-
-  // Reset the UART state to avoid variable scheduling/jitter on Teensy Serial1
   MODEM_SERIAL.end();
   MODEM_SERIAL.begin(MODEM_BAUD);
-
-  // Single contiguous burst:
   MODEM_SERIAL.write((const uint8_t*)cmd, len);
-
-  // Ensure all bytes have physically left the UART (gives you a consistent offset)
   MODEM_SERIAL.flush();
-
-  // Publish what we sent (as-is)
   publish_string(&pub_sent, &msg_sent, cmd);
 }
 #endif
@@ -262,7 +212,6 @@ void setup()
 
   set_microros_transports();
 
-  // Wait for agent (blink while waiting)
   while (RMW_RET_OK != rmw_uros_ping_agent(500, 1)) {
     digitalWrite(LED_BUILTIN, HIGH); delay(50);
     digitalWrite(LED_BUILTIN, LOW);  delay(450);
@@ -282,46 +231,35 @@ void setup()
   require_ok(rclc_node_init_default(&node, "succorfish_receiver", "", &support), 3);
 #endif
 
-  // Build rooted topic names (persist for lifetime of publisher)
   make_topic(topic_sent, sizeof(topic_sent), "/succorfish/msg/sent");
   make_topic(topic_recv, sizeof(topic_recv), "/succorfish/msg/received");
 #if !MODE_TRANSMITTER
   make_topic(topic_delta, sizeof(topic_delta), "/succorfish/delta_t");
 #endif
 
-  // /<root>/succorfish/msg/sent
+  // --- Best-effort publishers ---
   require_ok(
-    rclc_publisher_init_default(
-      &pub_sent, &node,
+    rclc_publisher_init_best_effort(&pub_sent, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-      topic_sent
-    ),
+      topic_sent),
     4
   );
-
-  // /<root>/succorfish/msg/received
   require_ok(
-    rclc_publisher_init_default(
-      &pub_recv, &node,
+    rclc_publisher_init_best_effort(&pub_recv, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-      topic_recv
-    ),
+      topic_recv),
     5
   );
-
 #if !MODE_TRANSMITTER
-  // /<root>/succorfish/delta_t
   require_ok(
-    rclc_publisher_init_default(
-      &pub_delta, &node,
+    rclc_publisher_init_best_effort(&pub_delta, &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-      topic_delta
-    ),
+      topic_delta),
     6
   );
 #endif
 
-  // Init messages and bind to static buffers (no mallocs later)
+  // Init messages and bind static buffers
   std_msgs__msg__String__init(&msg_sent);
   msg_sent.data.data = ros_sent_buf;
   msg_sent.data.capacity = sizeof(ros_sent_buf);
@@ -336,7 +274,6 @@ void setup()
   std_msgs__msg__Int32__init(&msg_delta);
 #endif
 
-  // One-time announce (under the mode's namespace)
 #if MODE_TRANSMITTER
   publish_string(&pub_sent, &msg_sent, "transmitter_ready");
 #else
@@ -346,7 +283,6 @@ void setup()
 
 void loop()
 {
-  // PPS LED toggle requested by ISR (both TX and RX)
   if (pps_led_toggle_pending) {
     noInterrupts();
     pps_led_toggle_pending = false;
@@ -355,7 +291,6 @@ void loop()
   }
 
 #if MODE_TRANSMITTER
-  // PPS triggers modem command send
   if (pps_tx_pending) {
     noInterrupts();
     pps_tx_pending = false;
@@ -363,20 +298,16 @@ void loop()
     modem_send_cmd_and_publish(tx_cmd);
   }
 #else
-  // FLAG rising -> publish delta_t once per edge
   if (delta_pending) {
     noInterrupts();
     int32_t du = delta_us_isr;
     delta_pending = false;
     interrupts();
-
     msg_delta.data = du;
     (void)rcl_publish(&pub_delta, &msg_delta, NULL);
   }
 #endif
 
-  // Always parse modem UART and publish ONLY full lines on /<root>/succorfish/msg/received
   pump_modem_rx_publish_full_lines();
-
   delay(1);
 }
