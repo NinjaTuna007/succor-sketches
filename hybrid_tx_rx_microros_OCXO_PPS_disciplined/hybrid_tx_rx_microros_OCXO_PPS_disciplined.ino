@@ -1,18 +1,16 @@
-// hybrid_tx_rx_microros_TCXO_Puffin.ino
+// hybrid_tx_rx_microros_OCXO_holdover_Puffin.ino
 //
 // Teensy 4.1
-// HYBRID (TX/RX) via compile-time switch.
+// PPS-locked when available, OCXO-holdover when PPS is lost.
 //
 // Main idea:
-//   - GPT2 runs from external SiT5501 clock on pin 14
+//   - GPT2 runs from external OCXO clock on pin 14
 //   - GPT2 counter is prescaled to 1 MHz => 1 tick = 1 us
 //   - MODEM_FLAG is hardware-captured on GPT2 CAPIN1 (pin 15)
-//   - PPS is optionally hardware-captured on GPT2 CAPIN2 (pin 40)
-//   - If PPS is disabled, a GPT2 compare event every 1,000,000 ticks is used instead
-//
-// Trigger source options:
-//   USE_PPS_CAPTURE = 1 -> PPS on pin 40 defines the 1-second frame
-//   USE_PPS_CAPTURE = 0 -> GPT2 OCR1 compare every 1,000,000 ticks defines the 1-second frame
+//   - PPS is hardware-captured on GPT2 CAPIN2 (pin 40)
+//   - While PPS is present: epochs come from real PPS
+//   - When PPS is lost: epochs continue from last PPS-aligned phase using GPT2 OCR1 compare
+//   - When PPS returns: re-lock immediately
 //
 // micro-ROS options:
 //   ENABLE_MICROROS = 1 -> build with micro-ROS publishers enabled
@@ -21,12 +19,10 @@
 #include <Arduino.h>
 
 // ===================== FEATURE SWITCHES =================
-#define MODE_TRANSMITTER    0  // 1 = TX node, 0 = RX node
-#define USE_PPS_CAPTURE     1  // 1 = use PPS hardware capture on pin 40
-                               // 0 = use GPT2 compare at 1,000,000 ticks
-#define ENABLE_MICROROS     0  // 1 = enable micro-ROS, 0 = no micro-ROS
+#define MODE_TRANSMITTER     0 // 1 = TX node, 0 = RX node
+#define ENABLE_MICROROS      0  // 1 = enable micro-ROS, 0 = no micro-ROS
 #define ENABLE_DIAG_COUNTERS 0
-#define ENABLE_SERIAL_DEBUG 1
+#define ENABLE_SERIAL_DEBUG  1
 #define SERIAL_DEBUG_PERIOD_MS 1000
 
 #define RESTART_MODEM_UART_EACH_SEND 0   // 1 = MODEM_SERIAL.end()/begin() every send
@@ -62,6 +58,11 @@ static constexpr uint8_t PIN_PPS_CAPTURE    = 40;
 #define MODEM_SERIAL Serial1
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr size_t   LINE_MAX   = 256;
+// =======================================================
+
+// ===================== Holdover config =================
+static constexpr uint32_t EPOCH_US       = 1000000UL;
+static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;  // declare PPS lost if >1.2 s since last PPS
 // =======================================================
 
 // ===================== micro-ROS objects ===============
@@ -113,6 +114,7 @@ static volatile uint32_t dbg_trigger_count = 0;
 static volatile uint32_t dbg_prev_trigger_us = 0;
 static volatile uint32_t dbg_last_trigger_us = 0;
 static volatile int32_t  dbg_last_trigger_delta_us = 0;
+static volatile uint8_t  dbg_last_trigger_src = 0; // 0=none, 1=PPS, 2=HOLD
 
 static volatile uint32_t dbg_flag_count = 0;
 static volatile uint32_t dbg_last_flag_us = 0;
@@ -205,22 +207,66 @@ static void pump_modem_rx_publish_full_lines()
 #endif
 // =======================================================
 
-// ===================== Latched event state =============
-static volatile bool trigger_pending = false;
-static volatile uint32_t trigger_stamp = 0;
+// ===================== Latched ISR events ==============
+static volatile bool pps_pending = false;
+static volatile uint32_t pps_stamp = 0;
+
+static volatile bool cmp_pending = false;
+static volatile uint32_t cmp_stamp = 0;
 
 #if !MODE_TRANSMITTER
 static volatile bool flag_pending = false;
 static volatile uint32_t flag_stamp = 0;
 #endif
 
-#if !USE_PPS_CAPTURE
-static uint32_t gpt2_next_compare = 0;
+static volatile uint32_t gpt2_next_compare = 0;
+// =======================================================
+
+// ===================== Timing state ====================
+enum TimingMode : uint8_t {
+  TIMING_WAIT_PPS   = 0,
+  TIMING_PPS_LOCKED = 1,
+  TIMING_HOLDOVER   = 2
+};
+
+static TimingMode timing_mode = TIMING_WAIT_PPS;
+
+// This is the second boundary actually used for delta computation.
+// It is real PPS when locked, synthetic epoch when in holdover.
+static uint32_t current_epoch_us = 0;
+
+// Last real PPS edge seen.
+static uint32_t last_real_pps_us = 0;
+
+#if !MODE_TRANSMITTER
+static bool armed_for_flag = false;
 #endif
 // =======================================================
 
 // ===================== GPT2 init =======================
 extern "C" void GPT2_IRQHandler();
+
+static inline void gpt2_set_compare_us(uint32_t t_us)
+{
+  noInterrupts();
+  gpt2_next_compare = t_us;
+  GPT2_OCR1 = t_us;
+  interrupts();
+}
+
+static inline void gpt2_enable_compare_irq()
+{
+  noInterrupts();
+  GPT2_IR |= GPT_IR_OF1IE;
+  interrupts();
+}
+
+static inline void gpt2_disable_compare_irq()
+{
+  noInterrupts();
+  GPT2_IR &= ~GPT_IR_OF1IE;
+  interrupts();
+}
 
 static void gpt2_extclk_dual_capture_init_1mhz()
 {
@@ -251,14 +297,8 @@ static void gpt2_extclk_dual_capture_init_1mhz()
   // Free-run, capture on input1 and input2
   GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR | GPT_CR_IM1(1) | GPT_CR_IM2(1);
 
-#if USE_PPS_CAPTURE
+  // Start with FLAG + PPS only. Compare is enabled only during holdover.
   GPT2_IR = GPT_IR_IF1IE | GPT_IR_IF2IE;
-#else
-  uint32_t now = GPT2_CNT;
-  gpt2_next_compare = now + 1000000UL;
-  GPT2_OCR1 = gpt2_next_compare;
-  GPT2_IR = GPT_IR_IF1IE | GPT_IR_OF1IE;
-#endif
 
   NVIC_CLEAR_PENDING(IRQ_GPT2);
   attachInterruptVector(IRQ_GPT2, GPT2_IRQHandler);
@@ -282,24 +322,22 @@ extern "C" void GPT2_IRQHandler()
     GPT2_SR = GPT_SR_IF1;
   }
 
-#if USE_PPS_CAPTURE
   // PPS capture on ICR2
   if (sr & GPT_SR_IF2) {
-    trigger_stamp = GPT2_ICR2;
-    trigger_pending = true;
+    pps_stamp = GPT2_ICR2;
+    pps_pending = true;
     GPT2_SR = GPT_SR_IF2;
   }
-#else
-  // Compare fallback on OCR1
+
+  // Compare holdover epoch
   if (sr & GPT_SR_OF1) {
-    trigger_stamp = GPT2_OCR1;
-    trigger_pending = true;
+    cmp_stamp = GPT2_OCR1;
+    cmp_pending = true;
     GPT2_SR = GPT_SR_OF1;
 
-    gpt2_next_compare += 1000000UL;
+    gpt2_next_compare += EPOCH_US;
     GPT2_OCR1 = gpt2_next_compare;
   }
-#endif
 
   asm volatile("dsb");
 }
@@ -333,19 +371,69 @@ static void modem_send_cmd_and_publish(const char *cmd)
 #endif
 // =======================================================
 
-// ===================== Capture state ===================
-static uint32_t pps_us = 0;
+// ===================== Epoch handling ==================
+static void handle_epoch_trigger(uint32_t epoch_us, uint8_t src)
+{
+  current_epoch_us = epoch_us;
 
-#if !MODE_TRANSMITTER
-static bool armed_for_flag = false;
+  uint32_t prev = dbg_last_trigger_us;
+  dbg_prev_trigger_us = prev;
+  dbg_last_trigger_us = epoch_us;
+  dbg_last_trigger_delta_us = (prev == 0) ? 0 : (int32_t)(epoch_us - prev);
+  dbg_trigger_count++;
+  dbg_last_trigger_src = src;
+
+#if ENABLE_MICROROS
+  msg_pps.data = epoch_us;
+  (void)rcl_publish(&pub_pps, &msg_pps, NULL);
+
+  #if ENABLE_DIAG_COUNTERS
+  cnt_pps++;
+  if ((cnt_pps & 0x3F) == 0) {
+    msg_diag.data = cnt_pps;
+    (void)rcl_publish(&pub_diag, &msg_diag, NULL);
+  }
+  #endif
 #endif
 
+#if MODE_TRANSMITTER
+  modem_send_cmd_and_publish(tx_cmd);
+#else
+  armed_for_flag = true;
+#endif
+}
+
+static void maybe_enter_holdover()
+{
+  if (timing_mode != TIMING_PPS_LOCKED) return;
+
+  uint32_t now = sit_counter_us();
+  uint32_t since_last_pps = (uint32_t)(now - last_real_pps_us);
+
+  if (since_last_pps <= PPS_TIMEOUT_US) return;
+
+  // Advance to the current PPS-aligned second boundary that should already exist,
+  // then continue from there with compare-based synthetic epochs.
+  uint32_t missed_epochs = since_last_pps / EPOCH_US;
+  if (missed_epochs == 0) missed_epochs = 1;
+
+  current_epoch_us = last_real_pps_us + missed_epochs * EPOCH_US;
+  gpt2_set_compare_us(current_epoch_us + EPOCH_US);
+  gpt2_enable_compare_irq();
+  timing_mode = TIMING_HOLDOVER;
+
+#if !MODE_TRANSMITTER
+  // We are now living off the synthetic second grid.
+  armed_for_flag = true;
+#endif
+}
+// =======================================================
+
+// ===================== Diagnostic counters =============
 #if ENABLE_DIAG_COUNTERS
 static uint32_t cnt_pps = 0;
 static uint32_t cnt_flag = 0;
 static uint32_t cnt_flag_ignored = 0;
-static uint32_t cnt_pps_overwrite = 0;
-static uint32_t cnt_flag_overwrite = 0;
 #endif
 // =======================================================
 
@@ -359,10 +447,14 @@ static void print_debug_snapshot()
   uint32_t prev_trigger_us;
   uint32_t last_trigger_us;
   int32_t  last_trigger_delta_us;
+  uint8_t  last_trigger_src;
   uint32_t flag_count;
   uint32_t last_flag_us;
   int32_t  last_flag_delta_us;
   uint32_t ignored_flag_count;
+  uint32_t epoch_us_snapshot;
+  uint32_t last_real_pps_snapshot;
+  TimingMode mode_snapshot;
 
   noInterrupts();
   sit_now                = sit_counter_us();
@@ -371,21 +463,36 @@ static void print_debug_snapshot()
   prev_trigger_us        = dbg_prev_trigger_us;
   last_trigger_us        = dbg_last_trigger_us;
   last_trigger_delta_us  = dbg_last_trigger_delta_us;
+  last_trigger_src       = dbg_last_trigger_src;
   flag_count             = dbg_flag_count;
   last_flag_us           = dbg_last_flag_us;
   last_flag_delta_us     = dbg_last_flag_delta_us;
   ignored_flag_count     = dbg_ignored_flag_count;
+  epoch_us_snapshot      = current_epoch_us;
+  last_real_pps_snapshot = last_real_pps_us;
+  mode_snapshot          = timing_mode;
   dbg_last_sit_counter   = sit_now;
   dbg_last_teensy_micros = teensy_now;
   interrupts();
 
-#if USE_PPS_CAPTURE
+  const char *src_str =
+    (last_trigger_src == 1) ? "PPS" :
+    (last_trigger_src == 2) ? "HOLD" : "NONE";
+
+  const char *mode_str =
+    (mode_snapshot == TIMING_WAIT_PPS)   ? "WAIT_PPS" :
+    (mode_snapshot == TIMING_PPS_LOCKED) ? "PPS_LOCK" :
+                                           "HOLDOVER";
+
   Serial.printf(
-    "SRC=PPS | SIT_now=%u us | TeensyMicros=%u us | PPS_count=%u | PPS_ts=%u us | prev_PPS_ts=%u us | dPPS=%ld us | FLAG_count=%u | FLAG_ts=%u us | dFLAG=%ld us | FLAG_ignored=%u\n",
+    "MODE=%s | LAST_SRC=%s | SIT_now=%u us | TeensyMicros=%u us | TRIG_count=%u | EPOCH=%u us | LAST_REAL_PPS=%u us | prev_TRIG=%u us | dTRIG=%ld us | FLAG_count=%u | FLAG_ts=%u us | dFLAG=%ld us | FLAG_ignored=%u\n",
+    mode_str,
+    src_str,
     sit_now,
     teensy_now,
     trigger_count,
-    last_trigger_us,
+    epoch_us_snapshot,
+    last_real_pps_snapshot,
     prev_trigger_us,
     (long)last_trigger_delta_us,
     flag_count,
@@ -393,21 +500,6 @@ static void print_debug_snapshot()
     (long)last_flag_delta_us,
     ignored_flag_count
   );
-#else
-  Serial.printf(
-    "SRC=CMP | SIT_now=%u us | TeensyMicros=%u us | CMP_count=%u | CMP_ts=%u us | prev_CMP_ts=%u us | dCMP=%ld us | FLAG_count=%u | FLAG_ts=%u us | dFLAG=%ld us | FLAG_ignored=%u\n",
-    sit_now,
-    teensy_now,
-    trigger_count,
-    last_trigger_us,
-    prev_trigger_us,
-    (long)last_trigger_delta_us,
-    flag_count,
-    last_flag_us,
-    (long)last_flag_delta_us,
-    ignored_flag_count
-  );
-#endif
 }
 #endif
 // =======================================================
@@ -417,7 +509,7 @@ void setup()
 #if ENABLE_SERIAL_DEBUG
   Serial.begin(115200);
   delay(500);
-  Serial.println("Booting hybrid_tx_rx_microros_TCXO_Puffin...");
+  Serial.println("Booting hybrid_tx_rx_microros_OCXO_holdover_Puffin...");
   #if ENABLE_MICROROS
   Serial.println("micro-ROS: ENABLED");
   #else
@@ -462,7 +554,7 @@ void setup()
   gpt2_extclk_dual_capture_init_1mhz();
 
 #if ENABLE_SERIAL_DEBUG
-  Serial.println("GPT2 external-clock capture/compare initialized.");
+  Serial.println("GPT2 external-clock capture initialized.");
 #endif
 
 #if ENABLE_MICROROS
@@ -528,17 +620,6 @@ void setup()
 
     armed_for_flag = false;
   #endif
-
-  #if ENABLE_DIAG_COUNTERS
-    make_topic(topic_diag, sizeof(topic_diag), "/succorfish/diag_counts");
-    require_ok(
-      rclc_publisher_init_best_effort(
-        &pub_diag, &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt32),
-        topic_diag),
-      7);
-    std_msgs__msg__UInt32__init(&msg_diag);
-  #endif
 #else
   #if !MODE_TRANSMITTER
   armed_for_flag = false;
@@ -556,43 +637,42 @@ void loop()
   pump_modem_rx_publish_full_lines();
 #endif
 
-  // ---------- PPS / compare trigger source ----------
-  if (trigger_pending) {
+  // 1) If PPS has gone away, enter holdover from the last PPS-aligned phase.
+  maybe_enter_holdover();
+
+  // 2) Real PPS wins immediately and re-locks us if it comes back.
+  if (pps_pending) {
     noInterrupts();
-    uint32_t t_trigger = trigger_stamp;
-    trigger_pending = false;
+    uint32_t t_pps = pps_stamp;
+    pps_pending = false;
     interrupts();
 
-    pps_us = t_trigger;
+    last_real_pps_us = t_pps;
+    timing_mode = TIMING_PPS_LOCKED;
 
-    uint32_t prev = dbg_last_trigger_us;
-    dbg_prev_trigger_us = prev;
-    dbg_last_trigger_us = t_trigger;
-    dbg_last_trigger_delta_us = (prev == 0) ? 0 : (int32_t)(t_trigger - prev);
-    dbg_trigger_count++;
+    // Keep compare phase aligned to this PPS, but disable compare IRQ while locked
+    // so we do not generate duplicate epoch triggers.
+    gpt2_set_compare_us(t_pps + EPOCH_US);
+    gpt2_disable_compare_irq();
 
-#if ENABLE_MICROROS
-    msg_pps.data = pps_us;
-    (void)rcl_publish(&pub_pps, &msg_pps, NULL);
+    handle_epoch_trigger(t_pps, 1);
+  }
 
-    #if ENABLE_DIAG_COUNTERS
-    cnt_pps++;
-    if ((cnt_pps & 0x3F) == 0) {
-      msg_diag.data = cnt_pps;
-      (void)rcl_publish(&pub_diag, &msg_diag, NULL);
+  // 3) Synthetic epoch only matters during holdover.
+  if (cmp_pending) {
+    noInterrupts();
+    uint32_t t_cmp = cmp_stamp;
+    cmp_pending = false;
+    interrupts();
+
+    if (timing_mode == TIMING_HOLDOVER) {
+      handle_epoch_trigger(t_cmp, 2);
     }
-    #endif
-#endif
-
-#if MODE_TRANSMITTER
-    modem_send_cmd_and_publish(tx_cmd);
-#else
-    armed_for_flag = true;
-#endif
   }
 
 #if !MODE_TRANSMITTER
-  // ---------- FLAG capture (latched by ISR) ----------
+  // 4) FLAG capture is always measured against current_epoch_us
+  //    whether that epoch came from real PPS or synthetic holdover.
   if (flag_pending) {
     noInterrupts();
     uint32_t flag_us = flag_stamp;
@@ -606,7 +686,7 @@ void loop()
       cnt_flag_ignored++;
 #endif
     } else {
-      uint32_t du = (uint32_t)(flag_us - pps_us);
+      uint32_t du = (uint32_t)(flag_us - current_epoch_us);
 
       dbg_last_flag_us = flag_us;
       dbg_last_flag_delta_us = (int32_t)du;
