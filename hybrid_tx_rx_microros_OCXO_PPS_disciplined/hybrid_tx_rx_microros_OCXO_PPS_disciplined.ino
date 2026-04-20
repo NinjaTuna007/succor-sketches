@@ -1,4 +1,4 @@
-// hybrid_tx_rx_microros_OCXO_holdover_Puffin.ino
+// hybrid_tx_rx_microros_OCXO_PPS_disciplined.ino
 //
 // Teensy 4.1
 // PPS-locked when available, OCXO-holdover when PPS is lost.
@@ -19,14 +19,10 @@
 #include <Arduino.h>
 
 // ===================== FEATURE SWITCHES =================
-#define MODE_TRANSMITTER     0 // 1 = TX node, 0 = RX node
-#define ENABLE_MICROROS      0  // 1 = enable micro-ROS, 0 = no micro-ROS
-#define ENABLE_DIAG_COUNTERS 0
-#define ENABLE_SERIAL_DEBUG  1
+#define MODE_TRANSMITTER    0  // 1 = TX node, 0 = RX node
+#define ENABLE_MICROROS     0  // 1 = enable micro-ROS, 0 = no micro-ROS
+#define ENABLE_SERIAL_DEBUG 1
 #define SERIAL_DEBUG_PERIOD_MS 1000
-
-#define RESTART_MODEM_UART_EACH_SEND 0   // 1 = MODEM_SERIAL.end()/begin() every send
-                                         // 0 = keep UART continuously open
 // =======================================================
 
 #if ENABLE_MICROROS
@@ -62,7 +58,7 @@ static constexpr size_t   LINE_MAX   = 256;
 
 // ===================== Holdover config =================
 static constexpr uint32_t EPOCH_US       = 1000000UL;
-static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;  // declare PPS lost if >1.2 s since last PPS
+static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;
 // =======================================================
 
 // ===================== micro-ROS objects ===============
@@ -75,10 +71,6 @@ static char topic_recv[96];
 #else
 static char topic_flag[96];
 static char topic_delta[96];
-#endif
-
-#if ENABLE_DIAG_COUNTERS
-static char topic_diag[96];
 #endif
 
 static rcl_node_t node;
@@ -100,11 +92,6 @@ static rcl_publisher_t pub_flag;
 static rcl_publisher_t pub_delta;
 static std_msgs__msg__UInt32 msg_flag;
 static std_msgs__msg__Int32  msg_delta;
-#endif
-
-#if ENABLE_DIAG_COUNTERS
-static rcl_publisher_t pub_diag;
-static std_msgs__msg__UInt32 msg_diag;
 #endif
 #endif
 // =======================================================
@@ -230,12 +217,7 @@ enum TimingMode : uint8_t {
 };
 
 static TimingMode timing_mode = TIMING_WAIT_PPS;
-
-// This is the second boundary actually used for delta computation.
-// It is real PPS when locked, synthetic epoch when in holdover.
 static uint32_t current_epoch_us = 0;
-
-// Last real PPS edge seen.
 static uint32_t last_real_pps_us = 0;
 
 #if !MODE_TRANSMITTER
@@ -277,27 +259,20 @@ static void gpt2_extclk_dual_capture_init_1mhz()
   GPT2_SR = 0x3F;
   GPT2_IR = 0;
 
-  // External clock on pin 14: GPIO_AD_B1_02 ALT8
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
-  // CAPIN1 (FLAG) on pin 15: GPIO_AD_B1_03 ALT8
   IOMUXC_GPT2_IPP_IND_CAPIN1_SELECT_INPUT = 1;
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_03 = 8;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 = 0x13000;
 
-  // CAPIN2 (PPS) on pin 40: GPIO_AD_B1_04 ALT8
   IOMUXC_GPT2_IPP_IND_CAPIN2_SELECT_INPUT = 1;
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_04 = 8;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_04 = 0x13000;
 
-  // External clock 10 MHz, prescaler /10 => 1 MHz
   GPT2_PR = GPT_PR_PRESCALER(9);
-
-  // Free-run, capture on input1 and input2
   GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR | GPT_CR_IM1(1) | GPT_CR_IM2(1);
 
-  // Start with FLAG + PPS only. Compare is enabled only during holdover.
   GPT2_IR = GPT_IR_IF1IE | GPT_IR_IF2IE;
 
   NVIC_CLEAR_PENDING(IRQ_GPT2);
@@ -311,7 +286,6 @@ extern "C" void GPT2_IRQHandler()
 {
   uint32_t sr = GPT2_SR;
 
-  // FLAG capture on ICR1
   if (sr & GPT_SR_IF1) {
 #if !MODE_TRANSMITTER
     flag_stamp = GPT2_ICR1;
@@ -322,14 +296,12 @@ extern "C" void GPT2_IRQHandler()
     GPT2_SR = GPT_SR_IF1;
   }
 
-  // PPS capture on ICR2
   if (sr & GPT_SR_IF2) {
     pps_stamp = GPT2_ICR2;
     pps_pending = true;
     GPT2_SR = GPT_SR_IF2;
   }
 
-  // Compare holdover epoch
   if (sr & GPT_SR_OF1) {
     cmp_stamp = GPT2_OCR1;
     cmp_pending = true;
@@ -352,11 +324,6 @@ static void modem_send_cmd_and_publish(const char *cmd)
   const size_t len = strlen(cmd);
   if (len == 0 || len >= 128) die_blink(7);
 
-#if RESTART_MODEM_UART_EACH_SEND
-  MODEM_SERIAL.end();
-  MODEM_SERIAL.begin(MODEM_BAUD);
-#endif
-
   MODEM_SERIAL.write((const uint8_t*)cmd, len);
   MODEM_SERIAL.flush();
 
@@ -364,7 +331,7 @@ static void modem_send_cmd_and_publish(const char *cmd)
   publish_string(&pub_sent, &msg_sent, cmd);
 #else
   #if ENABLE_SERIAL_DEBUG
-  Serial.printf("MODEM_TX=\"%s\" | UART_restart=%d\n", cmd, RESTART_MODEM_UART_EACH_SEND);
+  Serial.printf("MODEM_TX=\"%s\"\n", cmd);
   #endif
 #endif
 }
@@ -386,14 +353,6 @@ static void handle_epoch_trigger(uint32_t epoch_us, uint8_t src)
 #if ENABLE_MICROROS
   msg_pps.data = epoch_us;
   (void)rcl_publish(&pub_pps, &msg_pps, NULL);
-
-  #if ENABLE_DIAG_COUNTERS
-  cnt_pps++;
-  if ((cnt_pps & 0x3F) == 0) {
-    msg_diag.data = cnt_pps;
-    (void)rcl_publish(&pub_diag, &msg_diag, NULL);
-  }
-  #endif
 #endif
 
 #if MODE_TRANSMITTER
@@ -412,8 +371,6 @@ static void maybe_enter_holdover()
 
   if (since_last_pps <= PPS_TIMEOUT_US) return;
 
-  // Advance to the current PPS-aligned second boundary that should already exist,
-  // then continue from there with compare-based synthetic epochs.
   uint32_t missed_epochs = since_last_pps / EPOCH_US;
   if (missed_epochs == 0) missed_epochs = 1;
 
@@ -423,18 +380,9 @@ static void maybe_enter_holdover()
   timing_mode = TIMING_HOLDOVER;
 
 #if !MODE_TRANSMITTER
-  // We are now living off the synthetic second grid.
   armed_for_flag = true;
 #endif
 }
-// =======================================================
-
-// ===================== Diagnostic counters =============
-#if ENABLE_DIAG_COUNTERS
-static uint32_t cnt_pps = 0;
-static uint32_t cnt_flag = 0;
-static uint32_t cnt_flag_ignored = 0;
-#endif
 // =======================================================
 
 // ===================== Serial debug ====================
@@ -515,7 +463,6 @@ void setup()
   #else
   Serial.println("micro-ROS: DISABLED");
   #endif
-  Serial.printf("RESTART_MODEM_UART_EACH_SEND=%d\n", RESTART_MODEM_UART_EACH_SEND);
 #endif
 
 #if ENABLE_SERIAL_DEBUG
@@ -637,10 +584,8 @@ void loop()
   pump_modem_rx_publish_full_lines();
 #endif
 
-  // 1) If PPS has gone away, enter holdover from the last PPS-aligned phase.
   maybe_enter_holdover();
 
-  // 2) Real PPS wins immediately and re-locks us if it comes back.
   if (pps_pending) {
     noInterrupts();
     uint32_t t_pps = pps_stamp;
@@ -650,15 +595,12 @@ void loop()
     last_real_pps_us = t_pps;
     timing_mode = TIMING_PPS_LOCKED;
 
-    // Keep compare phase aligned to this PPS, but disable compare IRQ while locked
-    // so we do not generate duplicate epoch triggers.
     gpt2_set_compare_us(t_pps + EPOCH_US);
     gpt2_disable_compare_irq();
 
     handle_epoch_trigger(t_pps, 1);
   }
 
-  // 3) Synthetic epoch only matters during holdover.
   if (cmp_pending) {
     noInterrupts();
     uint32_t t_cmp = cmp_stamp;
@@ -671,8 +613,6 @@ void loop()
   }
 
 #if !MODE_TRANSMITTER
-  // 4) FLAG capture is always measured against current_epoch_us
-  //    whether that epoch came from real PPS or synthetic holdover.
   if (flag_pending) {
     noInterrupts();
     uint32_t flag_us = flag_stamp;
@@ -681,10 +621,6 @@ void loop()
 
     if (!armed_for_flag) {
       dbg_ignored_flag_count++;
-
-#if ENABLE_DIAG_COUNTERS
-      cnt_flag_ignored++;
-#endif
     } else {
       uint32_t du = (uint32_t)(flag_us - current_epoch_us);
 
@@ -700,9 +636,6 @@ void loop()
       (void)rcl_publish(&pub_delta, &msg_delta, NULL);
 #endif
 
-#if ENABLE_DIAG_COUNTERS
-      cnt_flag++;
-#endif
       armed_for_flag = false;
     }
   }
