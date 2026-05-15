@@ -19,7 +19,7 @@
 #include <Arduino.h>
 
 // ===================== FEATURE SWITCHES =================
-#define MODE_TRANSMITTER    0  // 1 = TX node, 0 = RX node
+#define MODE_TRANSMITTER   1  // 1 = TX node, 0 = RX node
 #define ENABLE_MICROROS     0  // 1 = enable micro-ROS, 0 = no micro-ROS
 #define ENABLE_SERIAL_DEBUG 1
 #define SERIAL_DEBUG_PERIOD_MS 1000
@@ -209,6 +209,21 @@ static volatile uint32_t flag_stamp = 0;
 static volatile uint32_t gpt2_next_compare = 0;
 // =======================================================
 
+// ===================== Delta filters ===================
+#if !MODE_TRANSMITTER
+static constexpr uint8_t AVG20_LEN = 20;
+static constexpr float   EMA_ALPHA = 2.0f / (10.0f + 1.0f); // EMA over ~10 samples
+
+static int32_t  delta_hist[AVG20_LEN] = {0};
+static uint8_t  delta_hist_count = 0;
+static uint8_t  delta_hist_index = 0;
+static int64_t  delta_hist_sum   = 0;
+
+static bool     ema_initialized = false;
+static float    ema_delta = 0.0f;
+#endif
+// =======================================================
+
 // ===================== Timing state ====================
 enum TimingMode : uint8_t {
   TIMING_WAIT_PPS   = 0,
@@ -307,7 +322,7 @@ extern "C" void GPT2_IRQHandler()
     cmp_pending = true;
     GPT2_SR = GPT_SR_OF1;
 
-    gpt2_next_compare += EPOCH_US;
+    gpt2_next_compare += EPOCH_US + 5;
     GPT2_OCR1 = gpt2_next_compare;
   }
 
@@ -451,6 +466,46 @@ static void print_debug_snapshot()
 }
 #endif
 // =======================================================
+
+#if !MODE_TRANSMITTER
+static void update_and_print_delta_filters(int32_t raw_delta)
+{
+  // -------- EMA (~10 samples) --------
+  if (!ema_initialized) {
+    ema_delta = (float)raw_delta;
+    ema_initialized = true;
+  } else {
+    ema_delta = EMA_ALPHA * (float)raw_delta + (1.0f - EMA_ALPHA) * ema_delta;
+  }
+
+  // -------- Moving average over last 20 samples --------
+  if (delta_hist_count < AVG20_LEN) {
+    delta_hist[delta_hist_index] = raw_delta;
+    delta_hist_sum += raw_delta;
+    delta_hist_count++;
+  } else {
+    delta_hist_sum -= delta_hist[delta_hist_index];
+    delta_hist[delta_hist_index] = raw_delta;
+    delta_hist_sum += raw_delta;
+  }
+
+  delta_hist_index++;
+  if (delta_hist_index >= AVG20_LEN) delta_hist_index = 0;
+
+  float avg20 = (delta_hist_count > 0)
+    ? ((float)delta_hist_sum / (float)delta_hist_count)
+    : 0.0f;
+
+#if ENABLE_SERIAL_DEBUG
+  Serial.printf(
+    "raw_deltas=%ld, exp_deltas=%.3f, avg_deltas=%.3f\n",
+    (long)raw_delta,
+    (double)ema_delta,
+    (double)avg20
+  );
+#endif
+}
+#endif
 
 void setup()
 {
@@ -627,6 +682,7 @@ void loop()
       dbg_last_flag_us = flag_us;
       dbg_last_flag_delta_us = (int32_t)du;
       dbg_flag_count++;
+      update_and_print_delta_filters((int32_t)du);
 
 #if ENABLE_MICROROS
       msg_flag.data = flag_us;
