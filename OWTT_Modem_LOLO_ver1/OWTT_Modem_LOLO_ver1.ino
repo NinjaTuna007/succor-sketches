@@ -743,6 +743,22 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
   }
 }
 
+static uint32_t epoch_ref_for_capture(uint32_t t_capture)
+{
+  uint32_t ref = current_epoch_us;
+
+  // If the captured flag timestamp is before the current epoch edge,
+  // then the flag actually belongs to the previous epoch.
+  //
+  // This can happen when both PPS and receive flag are pending, and the
+  // main loop processes PPS first.
+  if ((int32_t)(t_capture - ref) < 0) {
+    ref -= EPOCH_US;
+  }
+
+  return ref;
+}
+
 static void handle_rxs_event(uint32_t t_rxs)
 {
   // Only receiver mode produces #I timing outputs.
@@ -755,13 +771,17 @@ static void handle_rxs_event(uint32_t t_rxs)
     return;
   }
 
-  pending_delta_us = (int32_t)((uint32_t)(t_rxs - current_epoch_us));
+  uint32_t ref_epoch_us = epoch_ref_for_capture(t_rxs);
+
+  pending_delta_us = (int32_t)((uint32_t)(t_rxs - ref_epoch_us));
   pending_delta_ms = millis();
   pending_delta_valid = true;
 
 #if ENABLE_USB_DEBUG
-  Serial.print("Flag captured delta_us=");
-  Serial.println(pending_delta_us);
+  Serial.print("Rx flag captured delta_us=");
+  Serial.print(pending_delta_us);
+  Serial.print(", ref_epoch_us=");
+  Serial.println(ref_epoch_us);
 #endif
 }
 
@@ -822,7 +842,10 @@ static void process_timing_events()
     }
   }
 
-  // Flag capture after epoch update, so delta uses the newest epoch.
+  // Receive flag capture after epoch bookkeeping.
+  // The delta calculation chooses the correct epoch based on the captured
+  // timestamp, not simply the newest processed PPS.
+
   if (recv_flag_pending) {
     noInterrupts();
     uint32_t t = recv_flag_stamp;
@@ -912,6 +935,7 @@ static bool handle_config_command(char *line)
   //   $Y101R
   //   $Y008T0001s
   //   $Y042T0074s
+  // if transmitter mode is expected to be T<listen_id><period>, means that this transmitter only transmits 1 period after the modem with <listen_id> has transmitted
 
   const char *p = line + 2;
 
@@ -949,7 +973,7 @@ static bool handle_config_command(char *line)
 
   if (mode == 'R' || mode == 'r') {
     if (*args != '\0') {
-      host_send_config_error(line, "BAD_EXTRA");
+      host_send_config_error(line, "BAD_ARGS");
       return true;
     }
 
@@ -1051,7 +1075,6 @@ static bool update_latest_gps_from_host(const char *line)
   Serial.println(latest_gps);
 #endif
 
-  // Intercepted, not forwarded to modem.
   return true;
 }
 
@@ -1063,7 +1086,7 @@ static bool send_latest_gps_broadcast()
 
   if (!latest_gps_valid || latest_gps_len < 2 || latest_gps_len > 64) {
 #if ENABLE_USB_DEBUG
-    Serial.println("AUTO_TX skipped: no valid GPS");
+    Serial.println("WARN: no valid GPS to send to HOST");
 #endif
     return false;
   }
@@ -1080,7 +1103,7 @@ static bool send_latest_gps_broadcast()
 
   if (n < 0 || (size_t)n >= sizeof(cmd)) {
 #if ENABLE_USB_DEBUG
-    Serial.println("AUTO_TX skipped: command overflow");
+    Serial.println("WARN: command overflow, auto-TX skipped");
 #endif
     return false;
   }
@@ -1308,13 +1331,10 @@ static bool handle_pending_config_modem_line(const char *line)
   }
 
   if (strcmp(line, "E") == 0) {
-    abort_pending_config("ADDR_REJECTED");
+    abort_pending_config("ADDRESS_REJECTED");
     return true;
   }
 
-  // Some unrelated modem output while config is pending.
-  // Forwarding already happened in handle_modem_line(), but do not process it
-  // as GPS/round-robin while config is unresolved.
   return true;
 }
 
