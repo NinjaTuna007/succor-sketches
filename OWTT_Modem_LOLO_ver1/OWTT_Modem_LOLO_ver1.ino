@@ -90,7 +90,6 @@
 #define ENABLE_USB_DEBUG 1
 
 #define USB_MIRROR_HOST_OUTPUT 1
-#define USB_MIRROR_HOST_EXACT  0  // 0 = prefixed, 1 = exact raw line
 
 #define MODEM_SERIAL Serial1
 #define HOST_SERIAL  Serial2
@@ -248,20 +247,14 @@ static bool read_line(Stream &s, LineReader &r, char *out, size_t out_sz)
 
 static void host_send_line(const char *line)
 {
-  // Real host / LoLo output.
+  // send to LoLo
   HOST_SERIAL.print(line);
   HOST_SERIAL.print("\r\n");
 
 #if ENABLE_USB_DEBUG && USB_MIRROR_HOST_OUTPUT
-  #if USB_MIRROR_HOST_EXACT
-    // USB sees exactly the same line as the host.
-    Serial.print(line);
-    Serial.print("\r\n");
-  #else
-    // Safer for debugging: clearly marks what was sent to host.
-    Serial.print("HOST_SEES: ");
-    Serial.println(line);
-  #endif
+  // Marks on the programming side what LoLo sees in case we don't have access to that
+  Serial.print("-- HOST_SEES: ");
+  Serial.println(line);
 #endif
 }
 
