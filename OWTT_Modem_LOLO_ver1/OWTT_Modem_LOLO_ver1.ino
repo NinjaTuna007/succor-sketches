@@ -140,7 +140,7 @@ struct BridgeConfig {
   uint32_t period_pps;
 
   bool tx_scheduled;
-  uint32_t next_tx_pps_count;
+  uint32_t next_tx_epoch_count;
 };
 
 static BridgeConfig cfg = {
@@ -149,7 +149,7 @@ static BridgeConfig cfg = {
   "000",  // listen_id
   1, // period_pps
   false, // tx_scheduled
-  0 // next_tx_pps_count
+  0 // next_tx_epoch_count
 };
 
 struct PendingConfig {
@@ -494,6 +494,7 @@ static volatile bool cmp_pending = false;
 // Store timestamp and process it when free
 static volatile uint32_t cmp_stamp = 0;
 
+// Used to establish the value of the OCR Register of the Timer : gpt2_next_compare += EPOCH, with EPOCH being determined by the config -> delay between transmissions
 static volatile uint32_t gpt2_next_compare = 0;
 
 enum TimingMode : uint8_t {
@@ -504,22 +505,20 @@ enum TimingMode : uint8_t {
 
 static TimingMode timing_mode = TIMING_WAIT_PPS;
 
-// This is now really "epoch count", not only real PPS count.
-// It increments on real PPS and on holdover virtual PPS.
-static uint32_t pps_count = 0;
+// It increments on real PPS and on holdover virtual PPS. Keeps tracks of how many transmissions should have taken place
+static uint32_t epoch_count = 0;
 
 static uint32_t current_epoch_us = 0;
-static uint32_t last_real_pps_us = 0;
+static uint32_t last_real_pps_us = 0; // Time of last synchronisation
 static bool pps_valid = false;
 
-
-static bool pending_delta_valid = false;
+static bool pending_delta_valid = false; // Calculates deltas only if received GPS coords from a transmitter
 static int32_t pending_delta_us = 0;
 static uint32_t pending_delta_ms = 0;
 
 extern "C" void GPT2_IRQHandler();
 
-static inline uint32_t sit_counter_us()
+static inline uint32_t OCXO_counter_us()
 {
   return GPT2_CNT;
 }
@@ -637,7 +636,7 @@ static void schedule_first_transmitter_after_config()
   }
 
   // First leader starts at the next PPS, then repeats every period_pps.
-  cfg.next_tx_pps_count = pps_count + 1;
+  cfg.next_tx_epoch_count = epoch_count + 1;
   cfg.tx_scheduled = true;
 }
 
@@ -716,7 +715,7 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
 {
   current_epoch_us = t_epoch;
   pps_valid = true;
-  pps_count++;
+  epoch_count++;
 
   if (real_pps) {
     last_real_pps_us = t_epoch;
@@ -728,11 +727,11 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
   }
 
   if (cfg.mode == MODE_TRANSMITTER && cfg.tx_scheduled) {
-    if ((int32_t)(pps_count - cfg.next_tx_pps_count) >= 0) {
+    if ((int32_t)(epoch_count - cfg.next_tx_epoch_count) >= 0) {
       tx_auto_due = true;
 
       if (is_first_transmitter()) {
-        cfg.next_tx_pps_count = pps_count + cfg.period_pps;
+        cfg.next_tx_epoch_count = epoch_count + cfg.period_pps;
         cfg.tx_scheduled = true;
       } else {
         cfg.tx_scheduled = false;
@@ -769,7 +768,7 @@ static void maybe_enter_holdover()
     return;
   }
 
-  uint32_t now = sit_counter_us();
+  uint32_t now = OCXO_counter_us();
   uint32_t since_last_pps = (uint32_t)(now - last_real_pps_us);
 
   if (since_last_pps <= PPS_TIMEOUT_US) {
@@ -1211,14 +1210,14 @@ static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
 
   // Heard the predecessor leader.
   // Schedule own broadcast after configured PPS delay.
-  cfg.next_tx_pps_count = pps_count + cfg.period_pps;
+  cfg.next_tx_epoch_count = epoch_count + cfg.period_pps;
   cfg.tx_scheduled = true;
 
 #if ENABLE_USB_DEBUG
   Serial.print("ROUND_ROBIN: heard ");
   Serial.print(src_id);
-  Serial.print(", scheduled TX at pps_count=");
-  Serial.println(cfg.next_tx_pps_count);
+  Serial.print(", scheduled TX at epoch_count=");
+  Serial.println(cfg.next_tx_epoch_count);
 #endif
 }
 
