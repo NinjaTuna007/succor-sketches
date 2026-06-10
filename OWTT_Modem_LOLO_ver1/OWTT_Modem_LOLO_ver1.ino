@@ -1,10 +1,12 @@
 // OWTT_Modem_LoLo_ver1.ino
 //
-// Teensy 4.1 bridge between Host/LoLo and Succorfish/NM3 modem.
+// Teensy 4.1 bridge between Host (LoLo or Frigates) and Succorfish modem.
 //
 // UARTS:
-//   Serial1 = Succorfish
-//   Serial2 = Host -> LoLo / Frigates
+//   Serial1 = Succorfish modem
+//   Host / LoLo can be selected at compile time:
+//     HOST_OVER_USB = 1 -> Serial  = Host over Teensy Micro USB
+//     HOST_OVER_USB = 0 -> Serial2 = Host over UART
 //
 // Main behavior:
 //   - By default the Teensy boots in WIRE mode.
@@ -87,12 +89,28 @@
 // ===================== USER CONFIG =====================
 // =======================================================
 
-#define ENABLE_USB_DEBUG 1
+//   1 = Host / LoLo talks through Teensy Micro USB
+//   0 = Host / LoLo talks through UART Serial2
+//
+// If HOST_OVER_USB = 1:
+//   USB Serial must stay protocol-clean, so USB debug must be disabled
+//
+// If HOST_OVER_USB = 0:
+//   Serial2 is the host port, and USB Serial can be used for debug.
 
-#define USB_MIRROR_HOST_OUTPUT 1
+#define HOST_OVER_USB 1
 
 #define MODEM_SERIAL Serial1
-#define HOST_SERIAL  Serial2
+
+#if HOST_OVER_USB
+  #define HOST_SERIAL Serial
+  #define ENABLE_USB_DEBUG 0
+  #define USB_MIRROR_HOST_OUTPUT 0
+#else
+  #define HOST_SERIAL Serial2
+  #define ENABLE_USB_DEBUG 1
+  #define USB_MIRROR_HOST_OUTPUT 1
+#endif
 
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
@@ -1406,7 +1424,12 @@ void setup()
 #endif
 
   MODEM_SERIAL.begin(MODEM_BAUD, SERIAL_8N1);
+  #if HOST_OVER_USB
+  
+  HOST_SERIAL.begin(HOST_BAUD);
+  #else
   HOST_SERIAL.begin(HOST_BAUD, SERIAL_8N1);
+  #endif
 
   pinMode(PIN_OCXO, INPUT);
   pinMode(PIN_RXS_CAPTURE, INPUT);
@@ -1416,7 +1439,11 @@ void setup()
 
 #if ENABLE_USB_DEBUG
   Serial.println("Serial1 modem ready");
-  Serial.println("Serial2 host ready");
+  #if HOST_OVER_USB
+    Serial.println("USB Serial host ready");
+  #else
+    Serial.println("Serial2 host ready");
+  #endif
   Serial.println("GPT2 timing ready");
   Serial.println("Default mode: WIRE");
 #endif
