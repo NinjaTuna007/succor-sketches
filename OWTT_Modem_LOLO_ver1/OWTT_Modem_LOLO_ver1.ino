@@ -505,7 +505,7 @@ enum TimingMode : uint8_t {
 
 static TimingMode timing_mode = TIMING_WAIT_PPS;
 
-// It increments on real PPS and on holdover virtual PPS. Keeps tracks of how many transmissions should have taken place
+// It increments on real PPS and on holdover virtual PPS. Keeps tracks of how many transmissions passed -> good for orchestrating multiple transmitters
 static uint32_t epoch_count = 0;
 
 static uint32_t current_epoch_us = 0;
@@ -560,7 +560,7 @@ static void gpt2_extclk_capture_init_1mhz()
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
-  // RxS capture on pin 15:
+  // Receive Flag capture on pin 15:
   // GPIO_AD_B1_03 -> GPT2_CAPTURE1
   IOMUXC_GPT2_IPP_IND_CAPIN1_SELECT_INPUT = 1;
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_03 = 8;
@@ -576,7 +576,7 @@ static void gpt2_extclk_capture_init_1mhz()
 
   // CLKSRC(3): external clock
   // FRR: free-running
-  // IM1(1): capture 1 rising edge, RxS
+  // IM1(1): capture 1 rising edge, Receive Flag
   // IM2(1): capture 2 rising edge, PPS
   GPT2_CR = GPT_CR_CLKSRC(3) |
             GPT_CR_FRR |
@@ -596,14 +596,14 @@ extern "C" void GPT2_IRQHandler()
 {
   uint32_t sr = GPT2_SR;
 
-  // RxS capture: acoustic packet/header detected.
+  // Receive Flag capture: acoustic packet/header detected.
   if (sr & GPT_SR_IF1) {
     recv_flag_stamp = GPT2_ICR1;
     recv_flag_pending = true;
     GPT2_SR = GPT_SR_IF1;
   }
 
-  // Real PPS capture.
+  // PPS capture
   if (sr & GPT_SR_IF2) {
     pps_stamp = GPT2_ICR2;
     pps_pending = true;
@@ -721,7 +721,7 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     last_real_pps_us = t_epoch;
     timing_mode = TIMING_PPS_LOCKED;
 
-    // Prepare holdover compare, but keep it disabled while real PPS exists.
+    // Prepare holdover compare, but keep it disabled while we got real PPS
     gpt2_set_compare_us(t_epoch + EPOCH_US);
     gpt2_disable_compare_irq();
   }
@@ -757,7 +757,7 @@ static void handle_rxs_event(uint32_t t_rxs)
   pending_delta_valid = true;
 
 #if ENABLE_USB_DEBUG
-  Serial.print("RxS captured delta_us=");
+  Serial.print("Flag captured delta_us=");
   Serial.println(pending_delta_us);
 #endif
 }
