@@ -1352,7 +1352,7 @@ static void check_pending_config_timeout()
 static void handle_modem_line(char *line)
 {
 #if ENABLE_USB_DEBUG
-  Serial.print("MODEM_RX: ");
+  Serial.print("Received from Succor: ");
   Serial.println(line);
 #endif
 
@@ -1402,7 +1402,7 @@ void setup()
   Serial.begin(115200);
   delay(1000);
   Serial.println();
-  Serial.println("Booting Teensy Succorfish bridge");
+  Serial.println("Booting Translucent Teensy");
 #endif
 
   MODEM_SERIAL.begin(MODEM_BAUD, SERIAL_8N1);
