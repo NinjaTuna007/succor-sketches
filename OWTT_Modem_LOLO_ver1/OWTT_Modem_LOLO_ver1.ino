@@ -478,13 +478,20 @@ static void host_send_config_ok()
 // ===================== TIMING ==========================
 // =======================================================
 
+// PPS rising edge, record the time and process it when have time
 static volatile bool pps_pending = false;
+// Store timestamp when rising edge hit
 static volatile uint32_t pps_stamp = 0;
 
+// Succor flagged a received message, record that time and then process it after passing messages to HOST
 static volatile bool recv_flag_pending = false;
+// Store timestamp when Succor flag was risen
 static volatile uint32_t recv_flag_stamp = 0;
 
+// For HOLDOVER (no PPS)
+// Counter reached compare value (1 epoch has passed)
 static volatile bool cmp_pending = false;
+// Store timestamp and process it when free
 static volatile uint32_t cmp_stamp = 0;
 
 static volatile uint32_t gpt2_next_compare = 0;
