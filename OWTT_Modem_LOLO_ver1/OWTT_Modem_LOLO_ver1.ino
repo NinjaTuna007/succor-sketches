@@ -77,7 +77,7 @@
 //   - For reactive round-robin, follower delay must be large enough for:
 //       propagation_time + acoustic_packet_duration + guard
 //     otherwise the follower may learn too late that its trigger leader spoke.
-// $G1611.2328,12.12385
+// $G11.2328,12.12385
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -245,17 +245,6 @@ static bool read_line(Stream &s, LineReader &r, char *out, size_t out_sz)
 
   return false;
 }
-
-// static void host_send_line(const char *line)
-// {
-//   HOST_SERIAL.print(line);
-//   HOST_SERIAL.print("\r\n");
-
-// #if ENABLE_USB_DEBUG
-//   Serial.print("HOST_TX: ");
-//   Serial.println(line);
-// #endif
-//}
 
 static void host_send_line(const char *line)
 {
