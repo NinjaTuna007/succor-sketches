@@ -253,7 +253,7 @@ static void host_send_line(const char *line)
 
 #if ENABLE_USB_DEBUG && USB_MIRROR_HOST_OUTPUT
   // Marks on the programming side what LoLo sees in case we don't have access to that
-  Serial.print("-- HOST_SEES: ");
+  Serial.print("HOST SEES: ");
   Serial.println(line);
 #endif
 }
@@ -265,12 +265,12 @@ static void modem_send_command_no_terminator(const char *cmd)
     return;
   }
 
-  // Succorfish/NM3 modem commands require no CR/LF terminator.
+  // Succorfish modem commands require no CR/LF terminator
   MODEM_SERIAL.write((const uint8_t *)cmd, n);
   MODEM_SERIAL.flush();
 
 #if ENABLE_USB_DEBUG
-  Serial.print("MODEM_TX: ");
+  Serial.print("Sent to Succor: ");
   Serial.println(cmd);
 #endif
 }
@@ -373,6 +373,7 @@ static bool looks_like_gps_coords(const char *s)
   // Example:
   //   59.1234567,18.1234567
   //
+  // $G11.2328,12.12385
 
   char *end1 = NULL;
   char *end2 = NULL;
@@ -480,8 +481,8 @@ static void host_send_config_ok()
 static volatile bool pps_pending = false;
 static volatile uint32_t pps_stamp = 0;
 
-static volatile bool rxs_pending = false;
-static volatile uint32_t rxs_stamp = 0;
+static volatile bool recv_flag_pending = false;
+static volatile uint32_t recv_flag_stamp = 0;
 
 static volatile bool cmp_pending = false;
 static volatile uint32_t cmp_stamp = 0;
@@ -591,8 +592,8 @@ extern "C" void GPT2_IRQHandler()
 
   // RxS capture: acoustic packet/header detected.
   if (sr & GPT_SR_IF1) {
-    rxs_stamp = GPT2_ICR1;
-    rxs_pending = true;
+    recv_flag_stamp = GPT2_ICR1;
+    recv_flag_pending = true;
     GPT2_SR = GPT_SR_IF1;
   }
 
@@ -813,10 +814,10 @@ static void process_timing_events()
   }
 
   // RxS capture after epoch update, so delta uses the newest epoch.
-  if (rxs_pending) {
+  if (recv_flag_pending) {
     noInterrupts();
-    uint32_t t = rxs_stamp;
-    rxs_pending = false;
+    uint32_t t = recv_flag_stamp;
+    recv_flag_pending = false;
     interrupts();
 
     handle_rxs_event(t);
