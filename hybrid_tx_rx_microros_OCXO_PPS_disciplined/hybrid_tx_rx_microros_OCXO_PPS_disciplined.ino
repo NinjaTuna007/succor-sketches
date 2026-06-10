@@ -317,7 +317,7 @@ extern "C" void GPT2_IRQHandler()
 
 // ===================== TX send (TX only) ===============
 #if MODE_TRANSMITTER
-static const char tx_cmd[] = "$P007";
+static const char tx_cmd[] = "$P008";
 
 static void modem_send_cmd_and_publish(const char *cmd)
 {

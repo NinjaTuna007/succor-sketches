@@ -494,7 +494,10 @@ static volatile bool cmp_pending = false;
 // Store timestamp and process it when free
 static volatile uint32_t cmp_stamp = 0;
 
-// Used to establish the value of the OCR Register of the Timer : gpt2_next_compare += EPOCH, with EPOCH being determined by the config -> delay between transmissions
+// Used for OCXO holdover.
+// Compare interrupt fires every EPOCH_US = 1 second.
+// The transmitter period is handled separately by counting epochs:
+//   next_tx_epoch_count = epoch_count + cfg.period_pps
 static volatile uint32_t gpt2_next_compare = 0;
 
 enum TimingMode : uint8_t {
@@ -794,7 +797,7 @@ static void maybe_enter_holdover()
 
 static void process_timing_events()
 {
-  // Real PPS first. If PPS comes back underwater/on surface, it re-locks.
+  // Real PPS prioritized. If PPS comes back, it re-locks.
   if (pps_pending) {
     noInterrupts();
     uint32_t t = pps_stamp;
@@ -804,7 +807,7 @@ static void process_timing_events()
     handle_epoch_event(t, true);
   }
 
-  // If PPS has disappeared, switch to OCXO compare holdover.
+  // Check if PPS has disappeared -> switch to OCXO holdover
   maybe_enter_holdover();
 
   // Virtual PPS from GPT2 compare while in holdover.
@@ -819,7 +822,7 @@ static void process_timing_events()
     }
   }
 
-  // RxS capture after epoch update, so delta uses the newest epoch.
+  // Flag capture after epoch update, so delta uses the newest epoch.
   if (recv_flag_pending) {
     noInterrupts();
     uint32_t t = recv_flag_stamp;
