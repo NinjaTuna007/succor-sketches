@@ -198,6 +198,10 @@ static char latest_gps[GPS_MAX + 1] = {0};
 static size_t latest_gps_len = 0;
 static bool latest_gps_valid = false;
 
+static constexpr uint32_t GPS_VALID_EPOCHS = 5;
+
+static uint32_t latest_gps_epoch_count = 0;
+
 // Automatic TX due flag.
 // Set by PPS timing logic, executed later after host commands are serviced.
 static bool tx_auto_due = false;
@@ -738,11 +742,16 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
   pps_valid = true;
   epoch_count++;
 
+  if (latest_gps_valid &&
+      (uint32_t)(epoch_count - latest_gps_epoch_count) > GPS_VALID_EPOCHS) {
+    latest_gps_valid = false;
+    latest_gps_len = 0;
+  }
+
   if (real_pps) {
     last_real_pps_us = t_epoch;
     timing_mode = TIMING_PPS_LOCKED;
 
-    // Prepare holdover compare, but keep it disabled while we got real PPS
     gpt2_set_compare_us(t_epoch + EPOCH_US);
     gpt2_disable_compare_irq();
   }
@@ -1086,6 +1095,8 @@ static bool update_latest_gps_from_host(const char *line)
   memcpy(latest_gps, gps, n);
   latest_gps[n] = '\0';
   latest_gps_len = n;
+
+  latest_gps_epoch_count = epoch_count;
   latest_gps_valid = true;
 
 #if ENABLE_USB_DEBUG
