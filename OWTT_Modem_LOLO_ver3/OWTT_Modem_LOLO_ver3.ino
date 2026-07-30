@@ -1,4 +1,4 @@
-// OWTT_Modem_LoLo_ver3.ino
+// OWTT_Modem_LOLO_ver3.ino
 //
 // Teensy 4.1 bridge between Host (LoLo or Frigates) and Succorfish modem.
 //
@@ -125,6 +125,15 @@
 //   $ZUTC?
 //      Returns the maintained epoch UTC and reports PPS_LOCKED/HOLDOVER.
 //
+// Experiment controls:
+//   $ZPAYLOADTTL=0    Keep the latest $G/$K payload indefinitely (default).
+//   $ZPAYLOADTTL=N    Expire it after N PPS/holdover epochs.
+//   $ZTXWARN=1/0      Enable/disable one-shot TX warnings (default off).
+//   $ZOWTTHEADER?     Reprint the #OWTT CSV column header.
+//
+// Timestamped acoustic payload:
+//   T<unix_us:16d>|<seq:4hex>|<P/H/W>|<holdover:8hex>|<GPS-or-TEL-payload>
+//
 // Notes:
 //   - delta_us = RxS_capture_time_us - current_epoch_time_us.
 //   - current_epoch_time_us comes from real PPS when available,
@@ -151,7 +160,7 @@
 
 // USB host protocol must stay clean. Do not print asynchronous debug text to
 // Serial or SerialUSB1.
-#define ENABLE_USB_DEBUG 1
+#define ENABLE_USB_DEBUG 0
 #define USB_MIRROR_HOST_OUTPUT 0
 
 static constexpr uint32_t MODEM_BAUD = 9600;
@@ -276,7 +285,11 @@ static char latest_gps[GPS_MAX + 1] = {0};
 static size_t latest_gps_len = 0;
 static bool latest_gps_valid = false;
 
-static constexpr uint32_t GPS_VALID_EPOCHS = 5;
+// Payload lifetime in timing epochs. A value of 0 means the last valid GPS or
+// telemetry payload remains valid indefinitely. This experiment build boots
+// with infinite lifetime so one $G command can drive a long test. Change at
+// runtime with $ZPAYLOADTTL=<epochs>.
+static uint32_t payload_valid_epochs = 0;
 
 static uint32_t latest_gps_epoch_count = 0;
 
@@ -284,12 +297,36 @@ static uint32_t latest_gps_epoch_count = 0;
 // Stored WITH the leading "TEL:" frame marker, e.g. "TEL:<encoded...>".
 // The payload after "TEL:" is opaque host-encoded data; the Teensy never
 // parses it. When valid, telemetry takes precedence over GPS for the
-// scheduled broadcast. Ages out using the same GPS_VALID_EPOCHS window so a
-// stale telemetry frame is never rebroadcast indefinitely.
+// scheduled broadcast. payload_valid_epochs controls expiry; zero means the
+// stored frame remains valid indefinitely for long experiments.
 static char latest_telem[GPS_MAX + 1] = {0};
 static size_t latest_telem_len = 0;
 static bool latest_telem_valid = false;
 static uint32_t latest_telem_epoch_count = 0;
+
+// Experiment transmission metadata and output policy.
+static uint16_t tx_sequence = 0;
+static bool tx_warning_enabled = false;
+
+enum TxWarningReason : uint8_t {
+  TX_WARN_NONE = 0,
+  TX_WARN_NO_PAYLOAD,
+  TX_WARN_NO_UTC,
+  TX_WARN_PAYLOAD_TOO_LONG
+};
+
+static TxWarningReason tx_last_warning = TX_WARN_NONE;
+
+// Succorfish broadcast payload limit. Timestamp metadata is included inside
+// this limit. GPS coordinates comfortably fit; very large telemetry payloads
+// may need to be shortened.
+static constexpr size_t MODEM_PAYLOAD_MAX = 64;
+
+// Range is emitted in integer millimetres to keep CSV output deterministic.
+// 1500 m/s = 1,500,000 mm/s. Calibrate RANGE_FIXED_DELAY_US after measuring
+// command-to-acoustic-emission and receive-flag fixed latency.
+static constexpr int64_t SOUND_SPEED_MM_PER_S = 1500000LL;
+static constexpr int32_t RANGE_FIXED_DELAY_US = 0;
 
 // Automatic TX due flag.
 // Set by PPS timing logic, executed later after host commands are serviced.
@@ -672,6 +709,8 @@ static char mode_to_char(BridgeMode mode)
   return '?';
 }
 
+static void emit_owtt_csv_header();
+
 static void host_send_config_ok()
 {
   char msg[96];
@@ -730,7 +769,15 @@ enum TimingMode : uint8_t {
   TIMING_HOLDOVER   = 2
 };
 
+// Explicit prototype required for Arduino's .ino preprocessor. Without it,
+// Arduino may auto-generate this prototype before TimingMode is declared.
+static char timing_mode_code(TimingMode mode);
+
 static TimingMode timing_mode = TIMING_WAIT_PPS;
+
+// Number of OCXO-generated virtual seconds since the last real PPS. Reset to
+// zero on every real PPS.
+static uint32_t holdover_age_s = 0;
 
 // It increments on real PPS and on holdover virtual PPS. Keeps tracks of how many transmissions passed -> good for orchestrating multiple transmitters
 static uint32_t epoch_count = 0;
@@ -742,6 +789,9 @@ static bool pps_valid = false;
 static bool pending_delta_valid = false; // Calculates deltas only if received GPS coords from a transmitter
 static int32_t pending_delta_us = 0;
 static uint32_t pending_delta_ms = 0;
+static uint32_t pending_delta_holdover_age_s = 0;
+static uint32_t pending_delta_gnss_age_ms = 0;
+static char pending_delta_timing_mode = 'W';
 
 extern "C" void GPT2_IRQHandler();
 
@@ -770,6 +820,61 @@ static inline void gpt2_disable_compare_irq()
   noInterrupts();
   GPT2_IR &= ~GPT_IR_OF1IE;
   interrupts();
+}
+
+static char timing_mode_code(TimingMode mode)
+{
+  switch (mode) {
+    case TIMING_PPS_LOCKED:
+      return 'P';
+    case TIMING_HOLDOVER:
+      return 'H';
+    case TIMING_WAIT_PPS:
+    default:
+      return 'W';
+  }
+}
+
+// Build an absolute UTC timestamp from the UTC-labelled epoch and the OCXO
+// counter. This does not use serial-message arrival time for the fractional
+// timestamp. The serial UTC message labels the second; GPT2 supplies the
+// microseconds inside it.
+static bool utc_timestamp_for_counter(
+  uint32_t counter_us,
+  uint64_t *out_timestamp_us,
+  int64_t *out_epoch_second,
+  uint32_t *out_fraction_us)
+{
+  if (out_timestamp_us == NULL ||
+      out_epoch_second == NULL ||
+      out_fraction_us == NULL ||
+      !pps_valid ||
+      !current_epoch_utc_valid) {
+    return false;
+  }
+
+  int64_t second = current_epoch_utc_second;
+  uint32_t ref = current_epoch_us;
+
+  // If a capture belongs to the immediately previous epoch, move both the
+  // counter reference and UTC label back together.
+  if ((int32_t)(counter_us - ref) < 0) {
+    ref -= EPOCH_US;
+    second--;
+  }
+
+  uint32_t elapsed_us = (uint32_t)(counter_us - ref);
+
+  // This also handles the small window where an epoch interrupt occurred but
+  // the main loop has not processed it yet.
+  second += (int64_t)(elapsed_us / EPOCH_US);
+  const uint32_t fraction_us = elapsed_us % EPOCH_US;
+
+  *out_epoch_second = second;
+  *out_fraction_us = fraction_us;
+  *out_timestamp_us =
+    (uint64_t)second * (uint64_t)EPOCH_US + (uint64_t)fraction_us;
+  return true;
 }
 
 // =======================================================
@@ -1241,6 +1346,9 @@ static void apply_pending_config()
 #endif
 
   host_send_config_ok();
+  if (cfg.mode == MODE_RECEIVER) {
+    emit_owtt_csv_header();
+  }
 }
 
 static void abort_pending_config(const char *reason)
@@ -1264,16 +1372,26 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     current_epoch_utc_second++;
   }
 
-  if (latest_gps_valid &&
-      (uint32_t)(epoch_count - latest_gps_epoch_count) > GPS_VALID_EPOCHS) {
-    latest_gps_valid = false;
-    latest_gps_len = 0;
+  if (real_pps) {
+    holdover_age_s = 0;
+  } else if (timing_mode == TIMING_HOLDOVER) {
+    holdover_age_s++;
   }
 
-  if (latest_telem_valid &&
-      (uint32_t)(epoch_count - latest_telem_epoch_count) > GPS_VALID_EPOCHS) {
+  if (payload_valid_epochs != 0 &&
+      latest_gps_valid &&
+      (uint32_t)(epoch_count - latest_gps_epoch_count) > payload_valid_epochs) {
+    latest_gps_valid = false;
+    latest_gps_len = 0;
+    tx_last_warning = TX_WARN_NONE;
+  }
+
+  if (payload_valid_epochs != 0 &&
+      latest_telem_valid &&
+      (uint32_t)(epoch_count - latest_telem_epoch_count) > payload_valid_epochs) {
     latest_telem_valid = false;
     latest_telem_len = 0;
+    tx_last_warning = TX_WARN_NONE;
   }
 
   if (real_pps) {
@@ -1332,6 +1450,11 @@ static void handle_rxs_event(uint32_t t_rxs)
   pending_delta_us = (int32_t)((uint32_t)(t_rxs - ref_epoch_us));
   pending_delta_ms = millis();
   pending_delta_valid = true;
+  pending_delta_holdover_age_s = holdover_age_s;
+  pending_delta_timing_mode = timing_mode_code(timing_mode);
+  pending_delta_gnss_age_ms = gnss_utc.valid
+    ? (uint32_t)(millis() - gnss_utc.received_ms)
+    : 0xFFFFFFFFUL;
 
   pending_delta_utc_valid = current_epoch_utc_valid;
   pending_delta_utc_second = current_epoch_utc_second;
@@ -1430,11 +1553,19 @@ static void process_timing_events()
 static bool consume_delta(
   int32_t *out_delta_us,
   bool *out_utc_valid,
-  int64_t *out_utc_second)
+  int64_t *out_utc_second,
+  uint32_t *out_holdover_age_s,
+  uint32_t *out_gnss_age_ms,
+  char *out_timing_mode,
+  uint32_t *out_decode_delay_ms)
 {
   if (out_delta_us == NULL ||
       out_utc_valid == NULL ||
-      out_utc_second == NULL) {
+      out_utc_second == NULL ||
+      out_holdover_age_s == NULL ||
+      out_gnss_age_ms == NULL ||
+      out_timing_mode == NULL ||
+      out_decode_delay_ms == NULL) {
     return false;
   }
 
@@ -1445,6 +1576,10 @@ static bool consume_delta(
   *out_delta_us = pending_delta_us;
   *out_utc_valid = pending_delta_utc_valid;
   *out_utc_second = pending_delta_utc_second;
+  *out_holdover_age_s = pending_delta_holdover_age_s;
+  *out_gnss_age_ms = pending_delta_gnss_age_ms;
+  *out_timing_mode = pending_delta_timing_mode;
+  *out_decode_delay_ms = (uint32_t)(millis() - pending_delta_ms);
 
   pending_delta_valid = false;
   pending_delta_utc_valid = false;
@@ -1651,6 +1786,7 @@ static bool update_latest_gps_from_host(const char *line)
 
   latest_gps_epoch_count = epoch_count;
   latest_gps_valid = true;
+  tx_last_warning = TX_WARN_NONE;
 
 #if ENABLE_USB_DEBUG
   Serial.print("GPS updated: ");
@@ -1660,46 +1796,120 @@ static bool update_latest_gps_from_host(const char *line)
   return true;
 }
 
-static bool send_latest_gps_broadcast()
+static const char *tx_warning_name(TxWarningReason reason)
 {
-  if (cfg.mode != MODE_TRANSMITTER) {
+  switch (reason) {
+    case TX_WARN_NO_PAYLOAD:
+      return "NO_PAYLOAD";
+    case TX_WARN_NO_UTC:
+      return "NO_UTC";
+    case TX_WARN_PAYLOAD_TOO_LONG:
+      return "PAYLOAD_TOO_LONG";
+    case TX_WARN_NONE:
+    default:
+      return "NONE";
+  }
+}
+
+static void maybe_emit_tx_warning(TxWarningReason reason)
+{
+  if (reason == TX_WARN_NONE) {
+    tx_last_warning = TX_WARN_NONE;
+    return;
+  }
+
+  if (!tx_warning_enabled || tx_last_warning == reason) {
+    tx_last_warning = reason;
+    return;
+  }
+
+  tx_last_warning = reason;
+  char msg[64];
+  snprintf(msg, sizeof(msg), "#TXWARN,%s", tx_warning_name(reason));
+  host_send_line(msg);
+}
+
+// Timestamp envelope carried acoustically:
+//   T<unix_time_us:16d>|<seq:4hex>|<P/H/W>|<holdover:8hex>|<application payload>
+//
+// Example:
+//   T1784123000123456|003A|P|00000000|59.351034,18.068089
+//
+// unix_time_us is constructed from the UTC-labelled epoch plus the GPT2 OCXO
+// counter. It is sampled immediately before formatting/sending the modem
+// command. The remaining fixed command-to-emission latency must be calibrated.
+static bool send_timestamped_broadcast(const char *application_payload)
+{
+  if (application_payload == NULL || application_payload[0] == '\0') {
     return false;
   }
 
-  if (!latest_gps_valid || latest_gps_len < 2 || latest_gps_len > 64) {
-#if ENABLE_USB_DEBUG
-    Serial.println("WARN: no fresh GPS or telemetry available for scheduled modem broadcast");
-#endif
+  uint64_t tx_time_us = 0;
+  int64_t tx_epoch_second = 0;
+  uint32_t tx_fraction_us = 0;
+
+  if (!utc_timestamp_for_counter(
+        OCXO_counter_us(),
+        &tx_time_us,
+        &tx_epoch_second,
+        &tx_fraction_us)) {
+    maybe_emit_tx_warning(TX_WARN_NO_UTC);
+    return false;
+  }
+
+  (void)tx_epoch_second;
+  (void)tx_fraction_us;
+
+  char payload[MODEM_PAYLOAD_MAX + 1];
+  const int payload_len = snprintf(
+    payload,
+    sizeof(payload),
+    "T%016llu|%04X|%c|%08lX|%s",
+    (unsigned long long)tx_time_us,
+    (unsigned int)tx_sequence,
+    timing_mode_code(timing_mode),
+    (unsigned long)holdover_age_s,
+    application_payload
+  );
+
+  if (payload_len < 1 ||
+      (size_t)payload_len > MODEM_PAYLOAD_MAX ||
+      (size_t)payload_len >= sizeof(payload)) {
+    maybe_emit_tx_warning(TX_WARN_PAYLOAD_TOO_LONG);
     return false;
   }
 
   char cmd[96];
-
-  int n = snprintf(
+  const int cmd_len = snprintf(
     cmd,
     sizeof(cmd),
     "$B%02u%s",
-    (unsigned int)latest_gps_len,
-    latest_gps
+    (unsigned int)payload_len,
+    payload
   );
 
-  if (n < 0 || (size_t)n >= sizeof(cmd)) {
-#if ENABLE_USB_DEBUG
-    Serial.println("WARN: command overflow, auto-TX skipped");
-#endif
+  if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+    maybe_emit_tx_warning(TX_WARN_PAYLOAD_TOO_LONG);
     return false;
   }
 
   modem_send_command_no_terminator(cmd);
+  tx_sequence++;
+  maybe_emit_tx_warning(TX_WARN_NONE);
   return true;
 }
 
-// Handles "$K<payload>" telemetry updates from the host in transmitter mode.
-// "$K" is used as the command prefix instead of "$T" to avoid colliding with
-// the Succorfish modem's own "$T" command. The stored payload is prefixed
-// with the "TEL:" telemetry marker so the scheduled broadcast goes out as
-// "$BnnTEL:<payload>" and receivers recognise it as a telemetry frame. The
-// payload after "TEL:" is opaque to the Teensy.
+static bool send_latest_gps_broadcast()
+{
+  if (cfg.mode != MODE_TRANSMITTER ||
+      !latest_gps_valid ||
+      latest_gps_len < 2) {
+    return false;
+  }
+
+  return send_timestamped_broadcast(latest_gps);
+}
+
 static bool update_latest_telemetry_from_host(const char *line)
 {
   if (cfg.mode != MODE_TRANSMITTER) {
@@ -1731,6 +1941,7 @@ static bool update_latest_telemetry_from_host(const char *line)
 
   latest_telem_epoch_count = epoch_count;
   latest_telem_valid = true;
+  tx_last_warning = TX_WARN_NONE;
 
 #if ENABLE_USB_DEBUG
   Serial.print("Telemetry updated: ");
@@ -1742,33 +1953,13 @@ static bool update_latest_telemetry_from_host(const char *line)
 
 static bool send_latest_telemetry_broadcast()
 {
-  if (cfg.mode != MODE_TRANSMITTER) {
+  if (cfg.mode != MODE_TRANSMITTER ||
+      !latest_telem_valid ||
+      latest_telem_len < 2) {
     return false;
   }
 
-  if (!latest_telem_valid || latest_telem_len < 2 || latest_telem_len > 64) {
-    return false;
-  }
-
-  char cmd[96];
-
-  int n = snprintf(
-    cmd,
-    sizeof(cmd),
-    "$B%02u%s",
-    (unsigned int)latest_telem_len,
-    latest_telem
-  );
-
-  if (n < 0 || (size_t)n >= sizeof(cmd)) {
-#if ENABLE_USB_DEBUG
-    Serial.println("WARN: telemetry command overflow, auto-TX skipped");
-#endif
-    return false;
-  }
-
-  modem_send_command_no_terminator(cmd);
-  return true;
+  return send_timestamped_broadcast(latest_telem);
 }
 
 // =======================================================
@@ -1803,78 +1994,140 @@ static bool extract_source_id_from_modem_line(const char *line, char *src_id)
 // reports whether it is a "timed" payload, i.e. one we should emit #I for.
 // A payload is timed when it either looks like raw GPS coordinates
 // ("<lat>,<lon>") or is a telemetry frame (starts with the "TEL:" marker).
-static bool extract_timed_payload_from_modem_line(const char *line, char *payload, size_t payload_sz)
+struct TimedPayloadInfo {
+  bool timestamped;
+  char source_id[4];
+  uint64_t tx_time_us;
+  uint16_t sequence;
+  char tx_timing_mode;
+  uint32_t tx_holdover_age_s;
+  char application_payload[GPS_MAX + 1];
+};
+
+// Explicit prototypes required for Arduino's .ino preprocessor. The parser
+// otherwise places generated prototypes before TimedPayloadInfo is declared.
+static bool parse_timestamp_envelope(
+  const char *raw_payload,
+  TimedPayloadInfo *out);
+
+static bool extract_timed_payload_from_modem_line(
+  const char *line,
+  TimedPayloadInfo *out);
+
+static bool parse_timestamp_envelope(
+  const char *raw_payload,
+  TimedPayloadInfo *out)
 {
-  if (line == NULL || payload == NULL || payload_sz == 0) {
+  if (raw_payload == NULL || out == NULL || raw_payload[0] != 'T') {
     return false;
   }
 
-  payload[0] = '\0';
-
-  // Broadcast receive format:
-  //   #B<aaa><yy><data>[Q..][T..]
-  //
-  // Index:
-  //   0 '#'
-  //   1 'B'
-  //   2..4 aaa source address
-  //   5..6 yy length
-  //   7.. payload begins
-  if (line[0] == '#' && line[1] == 'B') {
-    if (!valid_3_digit_id(line + 2)) {
-      return false;
-    }
-
-    size_t n = 0;
-    if (!parse_two_digit_len(line + 5, &n)) {
-      return false;
-    }
-
-    if (n >= payload_sz) {
-      n = payload_sz - 1;
-    }
-
-    size_t line_len = strlen(line);
-    if (line_len < 7 + n) {
-      return false;
-    }
-
-    memcpy(payload, line + 7, n);
-    payload[n] = '\0';
-
-    return looks_like_gps_coords(payload) || looks_like_telemetry(payload);
+  char *end = NULL;
+  const unsigned long long tx_us = strtoull(raw_payload + 1, &end, 10);
+  if (end == raw_payload + 1 || end == NULL || *end != '|') {
+    return false;
   }
 
-  // Unicast receive format:
-  //   #U<yy><data>[Q..][T..]
-  //
-  // Index:
-  //   0 '#'
-  //   1 'U'
-  //   2..3 yy length
-  //   4.. payload begins
-  if (line[0] == '#' && line[1] == 'U') {
-    size_t n = 0;
+  const char *seq_start = end + 1;
+  const unsigned long seq = strtoul(seq_start, &end, 16);
+  if (end == seq_start || end == NULL || *end != '|' || seq > 0xFFFFUL) {
+    return false;
+  }
+
+  const char *mode_start = end + 1;
+  if ((mode_start[0] != 'P' && mode_start[0] != 'H' && mode_start[0] != 'W') ||
+      mode_start[1] != '|') {
+    return false;
+  }
+
+  const char *age_start = mode_start + 2;
+  const unsigned long tx_holdover_age = strtoul(age_start, &end, 16);
+  if (end == age_start || end == NULL || *end != '|') {
+    return false;
+  }
+
+  const char *application = end + 1;
+  if (!looks_like_gps_coords(application) &&
+      !looks_like_telemetry(application)) {
+    return false;
+  }
+
+  const size_t n = strlen(application);
+  if (n >= sizeof(out->application_payload)) {
+    return false;
+  }
+
+  out->timestamped = true;
+  out->tx_time_us = (uint64_t)tx_us;
+  out->sequence = (uint16_t)seq;
+  out->tx_timing_mode = mode_start[0];
+  out->tx_holdover_age_s = (uint32_t)tx_holdover_age;
+  memcpy(out->application_payload, application, n + 1);
+  return true;
+}
+
+static bool extract_timed_payload_from_modem_line(
+  const char *line,
+  TimedPayloadInfo *out)
+{
+  if (line == NULL || out == NULL) {
+    return false;
+  }
+
+  memset(out, 0, sizeof(*out));
+  strcpy(out->source_id, "000");
+  char raw_payload[MODEM_PAYLOAD_MAX + 1] = {0};
+  size_t n = 0;
+  const char *payload_start = NULL;
+
+  // Broadcast: #B<source:3><length:2><payload>...
+  if (line[0] == '#' && line[1] == 'B') {
+    if (!valid_3_digit_id(line + 2) ||
+        !parse_two_digit_len(line + 5, &n)) {
+      return false;
+    }
+
+    out->source_id[0] = line[2];
+    out->source_id[1] = line[3];
+    out->source_id[2] = line[4];
+    out->source_id[3] = '\0';
+    payload_start = line + 7;
+  } else if (line[0] == '#' && line[1] == 'U') {
+    // Unicast: #U<length:2><payload>...
     if (!parse_two_digit_len(line + 2, &n)) {
       return false;
     }
-
-    if (n >= payload_sz) {
-      n = payload_sz - 1;
-    }
-
-    size_t line_len = strlen(line);
-    if (line_len < 4 + n) {
-      return false;
-    }
-
-    memcpy(payload, line + 4, n);
-    payload[n] = '\0';
-
-    return looks_like_gps_coords(payload) || looks_like_telemetry(payload);
+    payload_start = line + 4;
+  } else {
+    return false;
   }
 
-  return false;
+  if (n > MODEM_PAYLOAD_MAX ||
+      strlen(line) < (size_t)(payload_start - line) + n) {
+    return false;
+  }
+
+  memcpy(raw_payload, payload_start, n);
+  raw_payload[n] = '\0';
+
+  if (parse_timestamp_envelope(raw_payload, out)) {
+    return true;
+  }
+
+  // Backward-compatible legacy GPS/TEL payload. It still produces #I/#J but
+  // cannot produce an absolute #OWTT row because TX time is absent.
+  if (!looks_like_gps_coords(raw_payload) &&
+      !looks_like_telemetry(raw_payload)) {
+    return false;
+  }
+
+  out->timestamped = false;
+  const size_t copy_n = strlen(raw_payload);
+  if (copy_n >= sizeof(out->application_payload)) {
+    return false;
+  }
+  memcpy(out->application_payload, raw_payload, copy_n + 1);
+  return true;
 }
 
 static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
@@ -1910,45 +2163,132 @@ static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
 #endif
 }
 
+static void emit_owtt_csv_header()
+{
+  host_send_line(
+    "#OWTT_HEADER,seq,src,tx_us,rx_us,tof_us,delta_us,range_mm,"
+    "rx_mode,rx_holdover_age_s,rx_gnss_age_ms,tx_mode,"
+    "tx_holdover_age_s,decode_delay_ms,lat,lon"
+  );
+}
+
+static bool split_gps_payload(
+  const char *payload,
+  char *lat, size_t lat_size,
+  char *lon, size_t lon_size)
+{
+  if (payload == NULL || lat == NULL || lon == NULL ||
+      lat_size == 0 || lon_size == 0 || !looks_like_gps_coords(payload)) {
+    return false;
+  }
+
+  const char *comma = strchr(payload, ',');
+  if (comma == NULL) {
+    return false;
+  }
+
+  const size_t lat_len = (size_t)(comma - payload);
+  const size_t lon_len = strlen(comma + 1);
+  if (lat_len >= lat_size || lon_len >= lon_size) {
+    return false;
+  }
+
+  memcpy(lat, payload, lat_len);
+  lat[lat_len] = '\0';
+  memcpy(lon, comma + 1, lon_len + 1);
+  return true;
+}
+
 static void maybe_emit_receiver_delta_after_modem_line(const char *line)
 {
   if (cfg.mode != MODE_RECEIVER) {
     return;
   }
 
-  char payload[GPS_MAX + 1];
-
-  if (!extract_timed_payload_from_modem_line(line, payload, sizeof(payload))) {
+  TimedPayloadInfo payload_info = {};
+  if (!extract_timed_payload_from_modem_line(line, &payload_info)) {
     return;
   }
 
-  // At this point the modem line (GPS or telemetry frame) has already been
-  // passed to the host. Keep the legacy #I line and optionally add an
-  // absolute UTC epoch label in a separate #J line.
   int32_t delta_us = 0;
   bool rx_utc_valid = false;
   int64_t rx_utc_second = 0;
+  uint32_t rx_holdover_age_s = 0;
+  uint32_t rx_gnss_age_ms = 0;
+  char rx_timing_mode = 'W';
+  uint32_t decode_delay_ms = 0;
   char info[32];
 
-  if (consume_delta(&delta_us, &rx_utc_valid, &rx_utc_second)) {
-    snprintf(info, sizeof(info), "#I%ld", (long)delta_us);
-    host_send_line(info);
-
-    if (EMIT_RX_UTC_LINE && rx_utc_valid) {
-      char utc_info[64];
-      snprintf(
-        utc_info,
-        sizeof(utc_info),
-        "#J%lld,%ld",
-        (long long)rx_utc_second,
-        (long)delta_us
-      );
-      host_send_line(utc_info);
-    }
-  } else {
-    snprintf(info, sizeof(info), "#INA");
-    host_send_line(info);
+  if (!consume_delta(
+        &delta_us,
+        &rx_utc_valid,
+        &rx_utc_second,
+        &rx_holdover_age_s,
+        &rx_gnss_age_ms,
+        &rx_timing_mode,
+        &decode_delay_ms)) {
+    host_send_line("#INA");
+    return;
   }
+
+  snprintf(info, sizeof(info), "#I%ld", (long)delta_us);
+  host_send_line(info);
+
+  if (EMIT_RX_UTC_LINE && rx_utc_valid) {
+    char utc_info[64];
+    snprintf(
+      utc_info,
+      sizeof(utc_info),
+      "#J%lld,%ld",
+      (long long)rx_utc_second,
+      (long)delta_us
+    );
+    host_send_line(utc_info);
+  }
+
+  if (!payload_info.timestamped || !rx_utc_valid) {
+    return;
+  }
+
+  const int64_t rx_time_us =
+    rx_utc_second * (int64_t)EPOCH_US + (int64_t)delta_us;
+  const int64_t raw_tof_us =
+    rx_time_us - (int64_t)payload_info.tx_time_us;
+  const int64_t calibrated_tof_us =
+    raw_tof_us - (int64_t)RANGE_FIXED_DELAY_US;
+  const int64_t range_mm =
+    (calibrated_tof_us * SOUND_SPEED_MM_PER_S) / 1000000LL;
+
+  char lat[24] = {0};
+  char lon[24] = {0};
+  split_gps_payload(
+    payload_info.application_payload,
+    lat, sizeof(lat),
+    lon, sizeof(lon)
+  );
+
+  char row[320];
+  snprintf(
+    row,
+    sizeof(row),
+    "#OWTT,%u,%s,%llu,%lld,%lld,%ld,%lld,%c,%lu,%lu,%c,%lu,%lu,%s,%s",
+    (unsigned int)payload_info.sequence,
+    payload_info.source_id,
+    (unsigned long long)payload_info.tx_time_us,
+    (long long)rx_time_us,
+    (long long)calibrated_tof_us,
+    (long)delta_us,
+    (long long)range_mm,
+    rx_timing_mode,
+    (unsigned long)rx_holdover_age_s,
+    (unsigned long)rx_gnss_age_ms,
+    payload_info.tx_timing_mode,
+    (unsigned long)payload_info.tx_holdover_age_s,
+    (unsigned long)decode_delay_ms,
+    lat,
+    lon
+  );
+  host_send_line(row);
 }
 
 // =======================================================
@@ -1984,7 +2324,7 @@ static void emit_gnss_status(bool include_last_nmea)
     sizeof(msg),
     "#GNSS,%s,uart_baud=%lu,usb_open=%u,rx_bytes=%lu,tx_bytes=%lu,"
     "rx_age_ms=%lu,ubx_ok=%lu,ubx_bad=%lu,timeutc=%lu,nmea=%lu,"
-    "timing=%s,utc_valid=%u,epoch_unix_s=%lld",
+    "timing=%s,utc_valid=%u,epoch_unix_s=%lld,holdover_age_s=%lu",
     !have_rx ? "NO_DATA" : (activity_fresh ? "ACTIVE" : "STALE"),
     (unsigned long)gnss_uart_baud,
     (bool)GNSS_USB_SERIAL ? 1U : 0U,
@@ -1997,7 +2337,8 @@ static void emit_gnss_status(bool include_last_nmea)
     (unsigned long)gnss_nmea_line_count,
     timing_mode_name(),
     current_epoch_utc_valid ? 1U : 0U,
-    (long long)current_epoch_utc_second
+    (long long)current_epoch_utc_second,
+    (unsigned long)holdover_age_s
   );
   host_send_line(msg);
 
@@ -2119,7 +2460,8 @@ static bool handle_gnss_utc_query(const char *line)
     msg,
     sizeof(msg),
     "#UTC,%s,timing=%s,epoch_valid=%u,epoch_unix_s=%lld,"
-    "last_gnss_unix_s=%lld,last_gnss_age_ms=%lu,tAcc_ns=%lu,nano=%ld",
+    "last_gnss_unix_s=%lld,last_gnss_age_ms=%lu,tAcc_ns=%lu,nano=%ld,"
+    "holdover_age_s=%lu",
     status,
     timing_mode_name(),
     current_epoch_utc_valid ? 1U : 0U,
@@ -2127,11 +2469,76 @@ static bool handle_gnss_utc_query(const char *line)
     (long long)(gnss_utc.valid ? gnss_utc.unix_second : 0),
     (unsigned long)age_ms,
     (unsigned long)(gnss_utc.valid ? gnss_utc.tAcc_ns : 0),
-    (long)(gnss_utc.valid ? gnss_utc.nano_ns : 0)
+    (long)(gnss_utc.valid ? gnss_utc.nano_ns : 0),
+    (unsigned long)holdover_age_s
   );
 
   host_send_line(msg);
   return true;
+}
+
+static bool handle_experiment_command(const char *line)
+{
+  if (line == NULL) {
+    return false;
+  }
+
+  if (strcmp(line, "$ZPAYLOADTTL?") == 0) {
+    char msg[64];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "#PAYLOADTTL,%lu",
+      (unsigned long)payload_valid_epochs
+    );
+    host_send_line(msg);
+    return true;
+  }
+
+  static const char ttl_prefix[] = "$ZPAYLOADTTL=";
+  if (starts_with(line, ttl_prefix)) {
+    const char *value_text = line + strlen(ttl_prefix);
+    char *end = NULL;
+    const unsigned long requested = strtoul(value_text, &end, 10);
+    if (value_text[0] == '\0' || end == NULL || *end != '\0') {
+      host_send_line("#PAYLOADTTL,ERROR");
+      return true;
+    }
+
+    payload_valid_epochs = (uint32_t)requested;
+    latest_gps_epoch_count = epoch_count;
+    latest_telem_epoch_count = epoch_count;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "#PAYLOADTTL,%lu", requested);
+    host_send_line(msg);
+    return true;
+  }
+
+  if (strcmp(line, "$ZTXWARN?") == 0) {
+    host_send_line(tx_warning_enabled ? "#TXWARN,ON" : "#TXWARN,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "$ZTXWARN=1") == 0) {
+    tx_warning_enabled = true;
+    tx_last_warning = TX_WARN_NONE;
+    host_send_line("#TXWARN,ON");
+    return true;
+  }
+
+  if (strcmp(line, "$ZTXWARN=0") == 0) {
+    tx_warning_enabled = false;
+    tx_last_warning = TX_WARN_NONE;
+    host_send_line("#TXWARN,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "$ZOWTTHEADER?") == 0) {
+    emit_owtt_csv_header();
+    return true;
+  }
+
+  return false;
 }
 
 static void handle_host_line(char *line)
@@ -2152,6 +2559,10 @@ static void handle_host_line(char *line)
     }
 
     if (handle_gnss_utc_query(line)) {
+      return;
+    }
+
+    if (handle_experiment_command(line)) {
       return;
     }
 
@@ -2265,7 +2676,13 @@ static void execute_auto_tx_if_due()
     return;
   }
 
-  send_latest_gps_broadcast();
+  if (send_latest_gps_broadcast()) {
+    return;
+  }
+
+  if (!latest_telem_valid && !latest_gps_valid) {
+    maybe_emit_tx_warning(TX_WARN_NO_PAYLOAD);
+  }
 }
 
 // =======================================================
