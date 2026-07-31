@@ -131,6 +131,19 @@
 //   $ZTXWARN=1/0      Enable/disable one-shot TX warnings (default off).
 //   $ZOWTTHEADER?     Reprint the #OWTT CSV column header.
 //
+// OCXO holdover experiment:
+//   $ZIGNOREPPSAFTER=0    Never ignore PPS (default; all normal sticks).
+//   $ZIGNOREPPSAFTER=N    After N seconds since boot, stop accepting real PPS
+//                         captures. last_real_pps_us then goes stale and timing
+//                         drifts into OCXO holdover (PPS_TIMEOUT_US later),
+//                         exactly as if the PPS wire had been cut. Payloads are
+//                         stamped 'H' and $ZUTC? reports HOLDOVER from then on.
+//                         Send =0 to re-arm (next real PPS re-locks).
+//   $ZIGNOREPPSAFTER?     Report the current limit (seconds, 0 = disabled).
+//
+//   $Z commands are handled even while a $Y modem config is pending, so the
+//   host may send this right after the $Y receiver/transmitter config.
+//
 // Timestamped acoustic payload:
 //   T<unix_us:16d>|<seq:4hex>|<P/H/W>|<holdover:8hex>|<GPS-or-TEL-payload>
 //
@@ -144,6 +157,10 @@
 // $G11.2328,12.12385
 
 #include <Arduino.h>
+
+#if !defined(USB_DUAL_SERIAL) && !defined(USB_TRIPLE_SERIAL)
+  #error "OWTT_Modem_LOLO_ver3 requires the 'Dual Serial' (or 'Triple Serial') USB type: Arduino IDE > Tools > USB Type > Dual Serial. SerialUSB1 is the GNSS bridge port."
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -835,6 +852,17 @@ static char timing_mode_code(TimingMode mode)
   }
 }
 
+// $ZIGNOREPPSAFTER experiment: after this many seconds of uptime, stop
+// accepting real PPS captures so timing drifts into OCXO holdover, as if the
+// PPS wire had been cut. 0 = never ignore (default on all normal sticks).
+static uint32_t ignore_pps_after_s = 0;
+
+static bool pps_ignored_now()
+{
+  return ignore_pps_after_s != 0 &&
+         millis() >= (uint32_t)ignore_pps_after_s * 1000UL;
+}
+
 // Build an absolute UTC timestamp from the UTC-labelled epoch and the OCXO
 // counter. This does not use serial-message arrival time for the fractional
 // timestamp. The serial UTC message labels the second; GPT2 supplies the
@@ -1518,7 +1546,12 @@ static void process_timing_events()
     pps_pending = false;
     interrupts();
 
-    handle_epoch_event(t, true);
+    // Holdover experiment: past the ignore deadline, drop real PPS captures.
+    // last_real_pps_us goes stale and maybe_enter_holdover() below switches
+    // to the OCXO epoch train, exactly like a physical PPS loss.
+    if (!pps_ignored_now()) {
+      handle_epoch_event(t, true);
+    }
   }
 
   // Check if PPS has disappeared -> switch to OCXO holdover
@@ -2530,6 +2563,35 @@ static bool handle_experiment_command(const char *line)
     tx_warning_enabled = false;
     tx_last_warning = TX_WARN_NONE;
     host_send_line("#TXWARN,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "$ZIGNOREPPSAFTER?") == 0) {
+    char msg[64];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "#IGNOREPPSAFTER,%lu",
+      (unsigned long)ignore_pps_after_s
+    );
+    host_send_line(msg);
+    return true;
+  }
+
+  static const char ignore_prefix[] = "$ZIGNOREPPSAFTER=";
+  if (starts_with(line, ignore_prefix)) {
+    const char *value_text = line + strlen(ignore_prefix);
+    char *end = NULL;
+    const unsigned long requested = strtoul(value_text, &end, 10);
+    if (value_text[0] == '\0' || end == NULL || *end != '\0') {
+      host_send_line("#IGNOREPPSAFTER,ERROR");
+      return true;
+    }
+
+    ignore_pps_after_s = (uint32_t)requested;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "#IGNOREPPSAFTER,%lu", requested);
+    host_send_line(msg);
     return true;
   }
 
