@@ -184,8 +184,20 @@ static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
 
 // Use the actual UART1 baud currently stored in the X20P. Your tested module
-// was using 115200. A factory-default X20P normally uses 38400.
-static constexpr uint32_t GNSS_INITIAL_BAUD = 38400;
+// Match X20P UART1 (CFG_UART1_BAUDRATE). Raised from 38400 to cut UBX
+// checksum losses when NAV output and RTCM share this bridge.
+static constexpr uint32_t GNSS_INITIAL_BAUD = 115200;
+
+// Extra HardwareSerial (Serial2) buffering for the X20P bridge.
+// Default Teensy RX is tiny (~64 B). When USB TX backpressures, service_gnss_bridge()
+// stops reading Serial2 so bytes aren't dropped on the USB side — but then Serial2's
+// own RX overflows and corrupts UBX frames (checksum failures). Larger RX absorbs
+// those stalls; larger TX absorbs RTCM bursts host -> X20P.
+// (apply helper is defined later — must not be the first function in this .ino or
+// Arduino's auto-prototypes are emitted before BridgeMode/LineReader exist.)
+static uint8_t gnss_uart_rx_extra[4096];
+static uint8_t gnss_uart_tx_extra[2048];
+static void gnss_uart_apply_extra_buffers();
 
 // Normal-operation default: keep Serial2 fixed at GNSS_INITIAL_BAUD.
 //
@@ -1284,6 +1296,12 @@ extern "C" void GPT2_IRQHandler()
     pps_stamp = GPT2_ICR2;
     pps_pending = true;
     GPT2_SR = GPT_SR_IF2;
+
+    // TEMP DIAGNOSTIC: toggle the built-in LED on every raw hardware PPS
+    // capture, straight from the ISR, bypassing all epoch/scheduling logic.
+    // Compare its blink rate directly against the X20P's own PPS LED.
+    // Remove once the PPS capture-rate mismatch is root-caused.
+    digitalToggleFast(LED_BUILTIN);
   }
 
   // Holdover virtual PPS compare.
@@ -2426,10 +2444,11 @@ static bool handle_gnss_debug_command(const char *line)
       return true;
     }
 
-    GNSS_SERIAL.flush();
-    GNSS_SERIAL.end();
-    GNSS_SERIAL.begin((uint32_t)requested, SERIAL_8N1);
-    gnss_uart_baud = (uint32_t)requested;
+  GNSS_SERIAL.flush();
+  GNSS_SERIAL.end();
+  GNSS_SERIAL.begin((uint32_t)requested, SERIAL_8N1);
+  gnss_uart_apply_extra_buffers();
+  gnss_uart_baud = (uint32_t)requested;
     ubx_parser_reset();
 
     // Re-send the RAM-only TIMEUTC output configuration at the newly selected
@@ -2846,9 +2865,16 @@ static void maybe_follow_gnss_usb_baud()
   GNSS_SERIAL.flush();
   GNSS_SERIAL.end();
   GNSS_SERIAL.begin(requested_baud, SERIAL_8N1);
+  gnss_uart_apply_extra_buffers();
 
   gnss_uart_baud = requested_baud;
   ubx_parser_reset();
+}
+
+static void gnss_uart_apply_extra_buffers()
+{
+  GNSS_SERIAL.addMemoryForRead(gnss_uart_rx_extra, sizeof(gnss_uart_rx_extra));
+  GNSS_SERIAL.addMemoryForWrite(gnss_uart_tx_extra, sizeof(gnss_uart_tx_extra));
 }
 
 static void service_gnss_bridge()
@@ -2911,6 +2937,10 @@ void setup()
   pinMode(PIN_OCXO, INPUT);
   pinMode(PIN_RXS_CAPTURE, INPUT);
   pinMode(PIN_PPS_CAPTURE, INPUT);
+
+  // TEMP DIAGNOSTIC: see GPT2_IRQHandler PPS-capture branch.
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWriteFast(LED_BUILTIN, LOW);
 
   gpt2_extclk_capture_init_1mhz();
 
