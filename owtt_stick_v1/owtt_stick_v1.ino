@@ -145,24 +145,34 @@
 //   host may send this right after the $Y receiver/transmitter config.
 //
 // Timestamped acoustic payload:
-//   T<unix_us:16d>|<seq:4hex>|<P/H/W>|<holdover:8hex>|<GPS-or-TEL-payload>
+//   T<ss>|<seq:hex>|<P/H/W>[|<holdover:hex>]|<GPS-or-TEL-payload>
+//
+// ss = transmit UTC time-of-minute (seconds, 0-59). Broadcasts are epoch/PPS
+// -aligned so the sub-second fraction is always ~0 and is omitted. Full unix
+// seconds are redundant (propagation is only a few seconds); the receiver
+// resolves the minute against its own UTC. holdover is emitted only when
+// non-zero (transmitter free-running); locked transmitters omit the field.
 //
 // Notes:
-//   - delta_us = RxS_capture_time_us - current_epoch_time_us.
-//   - current_epoch_time_us comes from real PPS when available,
-//     otherwise from OCXO holdover epochs.
+//   - #I<delta_us> is the one-way travel time from the envelope TX stamp to
+//     the local RX capture (absolute, can exceed 1e6 us).
+//   - Ranging (sound velocity, offsets, calibration) is a ROS/host concern.
 //   - For reactive round-robin, follower delay must be large enough for:
 //       propagation_time + acoustic_packet_duration + guard
 //     otherwise the follower may learn too late that its trigger leader spoke.
 // $G11.2328,12.12385
 
 #include <Arduino.h>
+#include <ctype.h>
 
 #if !defined(USB_DUAL_SERIAL) && !defined(USB_TRIPLE_SERIAL)
   #error "OWTT_Modem_LOLO_ver3 requires the 'Dual Serial' (or 'Triple Serial') USB type: Arduino IDE > Tools > USB Type > Dual Serial. SerialUSB1 is the GNSS bridge port."
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+#include "owtt_epd.h"
 
 // =======================================================
 // ===================== USER CONFIG =====================
@@ -183,10 +193,18 @@
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
 
-// Use the actual UART1 baud currently stored in the X20P. Your tested module
-// Match X20P UART1 (CFG_UART1_BAUDRATE). Raised from 38400 to cut UBX
-// checksum losses when NAV output and RTCM share this bridge.
+// Baud the X20P boots at (its stored UART1 config). The Teensy opens Serial2
+// here, then immediately raises UART1 to GNSS_TARGET_BAUD (RAM-only VALSET)
+// and follows. 115200 was a TIMEUTC latency bottleneck: NAV output, config
+// replies and RTCM share this UART, and queueing pushed TIMEUTC delivery past
+// the next PPS edge (whole-second label ambiguity).
 static constexpr uint32_t GNSS_INITIAL_BAUD = 115200;
+// Max supported UART1 rate on the X20P (u-blox interface limit).
+static constexpr uint32_t GNSS_TARGET_BAUD = 921600;
+// Link supervisor: if the receiver goes silent this long (e.g. it power
+// cycled and reverted to its stored baud), step the local baud and re-apply
+// the RAM config until bytes flow again.
+static constexpr uint32_t GNSS_LINK_SILENT_MS = 3000UL;
 
 // Extra HardwareSerial (Serial2) buffering for the X20P bridge.
 // Default Teensy RX is tiny (~64 B). When USB TX backpressures, service_gnss_bridge()
@@ -195,8 +213,8 @@ static constexpr uint32_t GNSS_INITIAL_BAUD = 115200;
 // those stalls; larger TX absorbs RTCM bursts host -> X20P.
 // (apply helper is defined later — must not be the first function in this .ino or
 // Arduino's auto-prototypes are emitted before BridgeMode/LineReader exist.)
-static uint8_t gnss_uart_rx_extra[4096];
-static uint8_t gnss_uart_tx_extra[2048];
+static uint8_t gnss_uart_rx_extra[8192];
+static uint8_t gnss_uart_tx_extra[4096];
 static void gnss_uart_apply_extra_buffers();
 
 // Normal-operation default: keep Serial2 fixed at GNSS_INITIAL_BAUD.
@@ -214,9 +232,8 @@ static constexpr bool GNSS_FOLLOW_USB_BAUD = false;
 // the receiver configuration.
 static constexpr bool GNSS_AUTO_ENABLE_TIMEUTC = true;
 
-// Keep the legacy #I<delta_us> line and optionally add:
-//   #J<rx_utc_unix_s>,<delta_us>
-// The #J line labels the receive capture with the absolute UTC second.
+// UTC-labelled capture (optional debug): absolute UTC second of the epoch the
+// RxS flag was captured in, plus the local capture delta within that second.
 static constexpr bool EMIT_RX_UTC_LINE = true;
 
 // Teensy 4.1 timing pins
@@ -232,8 +249,22 @@ static constexpr size_t GPS_MAX  = 64;
 
 // GNSS UTC parser / association limits.
 static constexpr uint16_t UBX_MAX_PAYLOAD = 1024;
-static constexpr uint32_t UTC_BIND_MAX_MESSAGE_LATENCY_US = 900000UL;
+// PPS↔UTC bind sanity cap on message-after-PPS age. The bind formula itself
+// tolerates any after_pps (see maybe_bind_gnss_utc_to_current_epoch), this
+// only rejects nonsense from stale epochs / counter races.
+static constexpr uint32_t UTC_BIND_MAX_AFTER_PPS_US = 2500000UL;
+// Samples that must agree on the max implied label before (re)binding, and
+// how many samples the max may go unseen before it is considered stale
+// (latency floor shifted / max was a glitch) and the tracker resets.
+static constexpr uint8_t UTC_BIND_CONFIRM_SAMPLES = 3;
+static constexpr uint8_t UTC_BIND_MAX_UNSEEN_SAMPLES = 60;
 static constexpr uint32_t UTC_STATUS_MAX_AGE_MS = 3000UL;
+// TOF plausibility ceiling for #I. A genuine one-way travel time must be
+// shorter than the leader's TX period (4 s) or pings would overlap; any
+// RxS↔#B mispairing (modem buffering decodes across mode churn) is off by
+// whole TX periods, so a ceiling below one period rejects every mispair.
+// 3 s ≈ 4.5 km at 1500 m/s — beyond these modems' reach anyway.
+static constexpr int64_t OWTT_MAX_PLAUSIBLE_TOF_US = 3000000LL;
 
 // GNSS diagnostics. Live debug is disabled at boot and can be enabled from
 // the first USB/host port with `$ZGNSSDEBUG=1`. It prints one summary per
@@ -247,7 +278,7 @@ static constexpr uint32_t EPOCH_US       = 1000000UL;
 static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;
 
 // Config timeout constant
-static constexpr uint32_t CONFIG_ADDR_TIMEOUT_MS = 1000;
+static constexpr uint32_t CONFIG_ADDR_TIMEOUT_MS = 5000;
 
 // =======================================================
 // ===================== MODES ===========================
@@ -308,6 +339,9 @@ static PendingConfig pending_cfg = {
   {0} // original_cmd
 };
 
+// Last config outcome shown on the e-ink status page ("ok", abort reason, ...).
+static char epd_cfg_line[20] = "ok";
+
 // Latest GPS payload stored on transmitter.
 // Payload is stored as raw "<lat>,<lon>", without "$G".
 static char latest_gps[GPS_MAX + 1] = {0};
@@ -351,11 +385,8 @@ static TxWarningReason tx_last_warning = TX_WARN_NONE;
 // may need to be shortened.
 static constexpr size_t MODEM_PAYLOAD_MAX = 64;
 
-// Range is emitted in integer millimetres to keep CSV output deterministic.
-// 1500 m/s = 1,500,000 mm/s. Calibrate RANGE_FIXED_DELAY_US after measuring
-// command-to-acoustic-emission and receive-flag fixed latency.
-static constexpr int64_t SOUND_SPEED_MM_PER_S = 1500000LL;
-static constexpr int32_t RANGE_FIXED_DELAY_US = 0;
+// Ranging (sound velocity, fixed delays, calibration) is done on the ROS/host
+// side from the #I one-way travel time plus the #OWTT context columns.
 
 // Automatic TX due flag.
 // Set by PPS timing logic, executed later after host commands are serviced.
@@ -444,6 +475,9 @@ static uint32_t gnss_last_rx_ms = 0;
 static uint32_t gnss_ubx_ok_count = 0;
 static uint32_t gnss_ubx_bad_checksum_count = 0;
 static uint32_t gnss_timeutc_count = 0;
+// Bridge bytes dropped because the USB-side reader stalled (local parsing
+// always continues; only forwarding is sacrificed).
+static uint32_t gnss_bridge_drop_count = 0;
 static uint32_t gnss_nmea_line_count = 0;
 static uint32_t gnss_last_nmea_ms = 0;
 static char gnss_last_nmea[GNSS_NMEA_MAX] = {0};
@@ -1003,6 +1037,37 @@ static bool gnss_utc_is_fresh()
          UTC_STATUS_MAX_AGE_MS;
 }
 
+// PPS↔UTC labelling, from GNSS data only (no host, no heuristics).
+//
+// The PPS edge train marks tops of UTC seconds; only the *name* of each
+// second must come from NAV-TIMEUTC. A message describing nav-epoch instant
+// T = unix_second + nano (exact regardless of u-blox civil rounding) reaches
+// the parser d seconds later, at after_pps seconds past the newest PPS edge.
+// If N is that edge's label:
+//
+//   N + after_pps = T + d   =>   N = floor(T - after_pps) + 1  for d in (0,1)
+//
+// Serial latency d is NOT guaranteed under 1 s here (a busy GNSS/USB bridge
+// pushes TIMEUTC past the next edge), so no single sample can be trusted.
+// But d is never negative — a message cannot precede the instant it
+// describes — so latency only ever makes the implied label too SMALL by
+// floor(d) whole seconds, never too large. Work in the PPS-tick-locked frame
+// m = implied_label - epoch_count (constant for a given true labelling) and
+// take the maximum m over recent samples: it equals the truth as long as one
+// message per window arrives with sub-second latency.
+//
+// The tracker below feeds every TIMEUTC sample and:
+//   - (re)binds only after UTC_BIND_CONFIRM_SAMPLES samples agree on max m
+//     (a lone upward glitch can never bind or rebind),
+//   - drops a max unseen for UTC_BIND_MAX_UNSEEN_SAMPLES samples (glitch, or
+//     the latency floor shifted) and rebuilds from current samples,
+//   - keeps auditing after binding, emitting #UTC,REBIND on any correction
+//     instead of silently carrying a ±1 s error in every TOF until reboot.
+static bool utc_track_have = false;
+static int64_t utc_track_max_m = 0;
+static uint8_t utc_track_max_count = 0;
+static uint8_t utc_track_max_unseen = 0;
+
 static void maybe_bind_gnss_utc_to_current_epoch()
 {
   if (!gnss_utc.valid ||
@@ -1011,27 +1076,80 @@ static void maybe_bind_gnss_utc_to_current_epoch()
     return;
   }
 
-  // UBX-NAV-TIMEUTC belongs to a navigation epoch. For direct association
-  // with 1PPS, require that navigation epoch to be at the top of a second.
-  const uint32_t tow_ms_in_second = gnss_utc.iTOW_ms % 1000UL;
-  if (tow_ms_in_second > 20UL && tow_ms_in_second < 980UL) {
+  const int64_t after_pps_us =
+    (int64_t)(int32_t)(gnss_utc.received_counter_us - current_epoch_us);
+
+  if (after_pps_us < 0 ||
+      after_pps_us > (int64_t)UTC_BIND_MAX_AFTER_PPS_US) {
     return;
   }
 
-  const int32_t message_after_pps_us =
-    (int32_t)(gnss_utc.received_counter_us - current_epoch_us);
+  // implied = floor(T - after_pps) + 1, in µs. The ±1 µs from nano/1000
+  // truncation is irrelevant against the whole-second decision.
+  const int64_t nav_epoch_us =
+    gnss_utc.unix_second * 1000000LL + (int64_t)(gnss_utc.nano_ns / 1000L);
+  const int64_t implied_label =
+    (nav_epoch_us - after_pps_us) / 1000000LL + 1LL;
+  const int64_t m = implied_label - (int64_t)epoch_count;
 
-  // The TIMEUTC packet should be emitted after the PPS/navigation epoch to
-  // which it refers. Reject a stale or unexpectedly delayed packet rather
-  // than introducing a one-second error.
-  if (message_after_pps_us < 0 ||
-      (uint32_t)message_after_pps_us >
-        UTC_BIND_MAX_MESSAGE_LATENCY_US) {
+  if (!utc_track_have || m > utc_track_max_m) {
+    utc_track_have = true;
+    utc_track_max_m = m;
+    utc_track_max_count = 1;
+    utc_track_max_unseen = 0;
+  } else if (m == utc_track_max_m) {
+    if (utc_track_max_count < 255U) {
+      utc_track_max_count++;
+    }
+    utc_track_max_unseen = 0;
+  } else {
+    // Sample below the max: latency burst (harmless) — unless the max itself
+    // never repeats, in which case it was the outlier.
+    if (++utc_track_max_unseen > UTC_BIND_MAX_UNSEEN_SAMPLES) {
+      utc_track_max_m = m;
+      utc_track_max_count = 1;
+      utc_track_max_unseen = 0;
+    }
+  }
+
+  if (utc_track_max_count < UTC_BIND_CONFIRM_SAMPLES) {
     return;
   }
 
-  current_epoch_utc_second = gnss_utc.unix_second;
-  current_epoch_utc_valid = true;
+  const int64_t label = utc_track_max_m + (int64_t)epoch_count;
+
+  if (!current_epoch_utc_valid) {
+    current_epoch_utc_second = label;
+    current_epoch_utc_valid = true;
+    current_epoch_utc_sync_ms = millis();
+    char msg[96];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "#UTC,BOUND,epoch_unix_s=%lld,after_pps_us=%lld",
+      (long long)current_epoch_utc_second,
+      (long long)after_pps_us
+    );
+    host_send_line(msg);
+    return;
+  }
+
+  if (label != current_epoch_utc_second) {
+    const int64_t diff = label - current_epoch_utc_second;
+    current_epoch_utc_second = label;
+    current_epoch_utc_sync_ms = millis();
+    char msg[64];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "#UTC,REBIND,diff_s=%lld,epoch_unix_s=%lld",
+      (long long)diff,
+      (long long)current_epoch_utc_second
+    );
+    host_send_line(msg);
+    return;
+  }
+
   current_epoch_utc_sync_ms = millis();
 }
 
@@ -1296,12 +1414,7 @@ extern "C" void GPT2_IRQHandler()
     pps_stamp = GPT2_ICR2;
     pps_pending = true;
     GPT2_SR = GPT_SR_IF2;
-
-    // TEMP DIAGNOSTIC: toggle the built-in LED on every raw hardware PPS
-    // capture, straight from the ISR, bypassing all epoch/scheduling logic.
-    // Compare its blink rate directly against the X20P's own PPS LED.
-    // Remove once the PPS capture-rate mismatch is root-caused.
-    digitalToggleFast(LED_BUILTIN);
+    // Pin 13 is SPI SCK for the e-ink panel; do not toggle LED_BUILTIN here.
   }
 
   // Holdover virtual PPS compare.
@@ -1357,6 +1470,9 @@ static void begin_pending_config(
   strncpy(pending_cfg.original_cmd, original_cmd, sizeof(pending_cfg.original_cmd) - 1);
   pending_cfg.original_cmd[sizeof(pending_cfg.original_cmd) - 1] = '\0';
 
+  strncpy(epd_cfg_line, "pending", sizeof(epd_cfg_line) - 1);
+  epd_cfg_line[sizeof(epd_cfg_line) - 1] = '\0';
+
   // Freeze automatic transmission while the modem address is being confirmed.
   tx_auto_due = false;
 
@@ -1377,6 +1493,9 @@ static void apply_pending_config()
   pending_delta_valid = false;
 
   pending_cfg.active = false;
+
+  strncpy(epd_cfg_line, "ok", sizeof(epd_cfg_line) - 1);
+  epd_cfg_line[sizeof(epd_cfg_line) - 1] = '\0';
 
   schedule_first_transmitter_after_config();
 
@@ -1403,6 +1522,9 @@ static void abort_pending_config(const char *reason)
     reason = "UNKNOWN";
   }
 
+  strncpy(epd_cfg_line, reason, sizeof(epd_cfg_line) - 1);
+  epd_cfg_line[sizeof(epd_cfg_line) - 1] = '\0';
+
   host_send_config_error(pending_cfg.original_cmd, reason);
   pending_cfg.active = false;
   tx_auto_due = false;
@@ -1410,18 +1532,35 @@ static void abort_pending_config(const char *reason)
 
 static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
 {
+  // Advance by *elapsed hardware time*, not by processed-event count. The
+  // pending-PPS slot only holds the latest capture: if the main loop stalls
+  // (USB backpressure), several edges collapse into one call and per-call ++
+  // would leave the UTC label seconds behind (observed as #UTC,REBIND,diff_s=15
+  // after node restarts). E-ink refreshes run on a TeensyThreads worker and
+  // no longer stall this path. The capture timestamps are exact, so the
+  // epoch delta is exact.
+  //
+  // elapsed == 0 happens on holdover→PPS relock when the real edge lands
+  // within half an epoch of the last virtual edge: same second, re-aligned
+  // timestamp, no label advance (per-call ++ used to double-count here).
+  uint32_t elapsed = 1;
+  if (pps_valid) {
+    const uint32_t dt = (uint32_t)(t_epoch - current_epoch_us);
+    elapsed = (dt + EPOCH_US / 2U) / EPOCH_US;
+  }
+
   current_epoch_us = t_epoch;
   pps_valid = true;
-  epoch_count++;
+  epoch_count += elapsed;
 
   if (current_epoch_utc_valid) {
-    current_epoch_utc_second++;
+    current_epoch_utc_second += (int64_t)elapsed;
   }
 
   if (real_pps) {
     holdover_age_s = 0;
   } else if (timing_mode == TIMING_HOLDOVER) {
-    holdover_age_s++;
+    holdover_age_s += elapsed;
   }
 
   if (payload_valid_epochs != 0 &&
@@ -1881,14 +2020,17 @@ static void maybe_emit_tx_warning(TxWarningReason reason)
 }
 
 // Timestamp envelope carried acoustically:
-//   T<unix_time_us:16d>|<seq:4hex>|<P/H/W>|<holdover:8hex>|<application payload>
+//   T<ss>|<seq:hex>|<P/H/W>[|<holdover:hex>]|<application payload>
 //
-// Example:
-//   T1784123000123456|003A|P|00000000|59.351034,18.068089
+// Examples:
+//   T04|003A|P|59.351034,18.068089          (PPS-locked, no holdover field)
+//   T04|003A|H|0000000B|59.351034,18.068089 (holdover, 11 s)
 //
-// unix_time_us is constructed from the UTC-labelled epoch plus the GPT2 OCXO
-// counter. It is sampled immediately before formatting/sending the modem
-// command. The remaining fixed command-to-emission latency must be calibrated.
+// ss is the transmit UTC time-of-minute (seconds, 0-59); broadcasts are
+// epoch/PPS-aligned so the sub-second fraction is always ~0 and is omitted.
+// The receiver reconstructs the full absolute time with its own UTC clock
+// (see resolve_tx_time_us). holdover is emitted only when non-zero (i.e. the
+// transmitter is free-running); a locked transmitter omits the field.
 static bool send_timestamped_broadcast(const char *application_payload)
 {
   if (application_payload == NULL || application_payload[0] == '\0') {
@@ -1908,20 +2050,36 @@ static bool send_timestamped_broadcast(const char *application_payload)
     return false;
   }
 
-  (void)tx_epoch_second;
+  (void)tx_time_us;
   (void)tx_fraction_us;
 
+  const int ss = (int)((tx_epoch_second % 60LL + 60LL) % 60LL);
+  const char mode = timing_mode_code(timing_mode);
+
   char payload[MODEM_PAYLOAD_MAX + 1];
-  const int payload_len = snprintf(
-    payload,
-    sizeof(payload),
-    "T%016llu|%04X|%c|%08lX|%s",
-    (unsigned long long)tx_time_us,
-    (unsigned int)tx_sequence,
-    timing_mode_code(timing_mode),
-    (unsigned long)holdover_age_s,
-    application_payload
-  );
+  int payload_len;
+  if (holdover_age_s != 0) {
+    payload_len = snprintf(
+      payload,
+      sizeof(payload),
+      "T%02d|%04X|%c|%08lX|%s",
+      ss,
+      (unsigned int)tx_sequence,
+      mode,
+      (unsigned long)holdover_age_s,
+      application_payload
+    );
+  } else {
+    payload_len = snprintf(
+      payload,
+      sizeof(payload),
+      "T%02d|%04X|%c|%s",
+      ss,
+      (unsigned int)tx_sequence,
+      mode,
+      application_payload
+    );
+  }
 
   if (payload_len < 1 ||
       (size_t)payload_len > MODEM_PAYLOAD_MAX ||
@@ -2042,13 +2200,13 @@ static bool extract_source_id_from_modem_line(const char *line, char *src_id)
 }
 
 // Extracts the data payload from a received broadcast/unicast modem line and
-// reports whether it is a "timed" payload, i.e. one we should emit #I for.
-// A payload is timed when it either looks like raw GPS coordinates
-// ("<lat>,<lon>") or is a telemetry frame (starts with the "TEL:" marker).
+// reports whether it carries a compact TX time stamp we can use for OWTT.
+// Only timestamped payloads drive #I; anything else is untimed.
 struct TimedPayloadInfo {
   bool timestamped;
   char source_id[4];
-  uint64_t tx_time_us;
+  uint8_t tx_ss;              // TX time-of-minute (seconds field 0..59)
+  uint32_t tx_fraction_us;    // µs within that second
   uint16_t sequence;
   char tx_timing_mode;
   uint32_t tx_holdover_age_s;
@@ -2073,9 +2231,10 @@ static bool parse_timestamp_envelope(
     return false;
   }
 
+  // T<ss>|<seq:hex>|<mode>[|<holdover:hex>]|<application>
   char *end = NULL;
-  const unsigned long long tx_us = strtoull(raw_payload + 1, &end, 10);
-  if (end == raw_payload + 1 || end == NULL || *end != '|') {
+  const unsigned long ss = strtoul(raw_payload + 1, &end, 10);
+  if (end == raw_payload + 1 || end == NULL || *end != '|' || ss > 59UL) {
     return false;
   }
 
@@ -2091,13 +2250,21 @@ static bool parse_timestamp_envelope(
     return false;
   }
 
-  const char *age_start = mode_start + 2;
-  const unsigned long tx_holdover_age = strtoul(age_start, &end, 16);
-  if (end == age_start || end == NULL || *end != '|') {
-    return false;
+  // Optional holdover field: TX only emits it when free-running (mode H).
+  // Do not probe for it under P/W — GPS payloads start with a hex digit and
+  // must not be mistaken for a holdover age.
+  const char *application = mode_start + 2;
+  unsigned long tx_holdover_age = 0;
+  if (mode_start[0] == 'H') {
+    const char *age_start = application;
+    const unsigned long age = strtoul(age_start, &end, 16);
+    if (end == age_start || end == NULL || *end != '|') {
+      return false;
+    }
+    tx_holdover_age = age;
+    application = end + 1;
   }
 
-  const char *application = end + 1;
   if (!looks_like_gps_coords(application) &&
       !looks_like_telemetry(application)) {
     return false;
@@ -2109,7 +2276,8 @@ static bool parse_timestamp_envelope(
   }
 
   out->timestamped = true;
-  out->tx_time_us = (uint64_t)tx_us;
+  out->tx_ss = (uint8_t)ss;
+  out->tx_fraction_us = 0;
   out->sequence = (uint16_t)seq;
   out->tx_timing_mode = mode_start[0];
   out->tx_holdover_age_s = (uint32_t)tx_holdover_age;
@@ -2161,24 +2329,9 @@ static bool extract_timed_payload_from_modem_line(
   memcpy(raw_payload, payload_start, n);
   raw_payload[n] = '\0';
 
-  if (parse_timestamp_envelope(raw_payload, out)) {
-    return true;
-  }
-
-  // Backward-compatible legacy GPS/TEL payload. It still produces #I/#J but
-  // cannot produce an absolute #OWTT row because TX time is absent.
-  if (!looks_like_gps_coords(raw_payload) &&
-      !looks_like_telemetry(raw_payload)) {
-    return false;
-  }
-
-  out->timestamped = false;
-  const size_t copy_n = strlen(raw_payload);
-  if (copy_n >= sizeof(out->application_payload)) {
-    return false;
-  }
-  memcpy(out->application_payload, raw_payload, copy_n + 1);
-  return true;
+  // Only envelope-stamped payloads carry a TX time; untimed payloads do not
+  // produce #I/#J/#OWTT at all.
+  return parse_timestamp_envelope(raw_payload, out);
 }
 
 static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
@@ -2217,7 +2370,7 @@ static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
 static void emit_owtt_csv_header()
 {
   host_send_line(
-    "#OWTT_HEADER,seq,src,tx_us,rx_us,tof_us,delta_us,range_mm,"
+    "#OWTT_HEADER,seq,src,tx_us,rx_us,tof_us,delta_us,"
     "rx_mode,rx_holdover_age_s,rx_gnss_age_ms,tx_mode,"
     "tx_holdover_age_s,decode_delay_ms,lat,lon"
   );
@@ -2250,14 +2403,61 @@ static bool split_gps_payload(
   return true;
 }
 
+// Resolve a compact envelope stamp (ss, fraction_us) against the local UTC
+// minute. One-way travel time is at most a few seconds, so the TX minute is
+// whichever candidate lands closest to the RX capture time (window ±30 s).
+static bool resolve_tx_time_us(
+  uint8_t tx_ss,
+  uint32_t tx_fraction_us,
+  int64_t rx_time_us,
+  int64_t *out_tx_time_us)
+{
+  if (out_tx_time_us == NULL || tx_ss > 59U || tx_fraction_us > 999999UL) {
+    return false;
+  }
+
+  const int64_t rx_second = rx_time_us / 1000000LL;
+  const int64_t minute_start = (rx_second - (rx_second % 60LL)) / 60LL * 60LL;
+
+  int64_t best_tx = 0;
+  int64_t best_abs = 0;
+  bool have_best = false;
+
+  for (int m = -1; m <= 1; ++m) {
+    const int64_t cand =
+      (minute_start + (int64_t)m * 60LL + (int64_t)tx_ss) * 1000000LL +
+      (int64_t)tx_fraction_us;
+    const int64_t diff = cand > rx_time_us
+      ? cand - rx_time_us
+      : rx_time_us - cand;
+    if (!have_best || diff < best_abs) {
+      best_abs = diff;
+      best_tx = cand;
+      have_best = true;
+    }
+  }
+
+  *out_tx_time_us = best_tx;
+  return true;
+}
+
 static void maybe_emit_receiver_delta_after_modem_line(const char *line)
 {
+  // Only attempt OWTT on broadcast/unicast data frames.
+  if (line == NULL || line[0] != '#' || (line[1] != 'B' && line[1] != 'U')) {
+    return;
+  }
+
   if (cfg.mode != MODE_RECEIVER) {
+    // #B reached us but we are not in receiver mode — ranging will stay silent.
+    host_send_line("#E,I,NOT_R");
     return;
   }
 
   TimedPayloadInfo payload_info = {};
   if (!extract_timed_payload_from_modem_line(line, &payload_info)) {
+    // Surfaced so a silent parse miss is obvious on the host.
+    host_send_line("#E,I,PARSE");
     return;
   }
 
@@ -2282,9 +2482,7 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     return;
   }
 
-  snprintf(info, sizeof(info), "#I%ld", (long)delta_us);
-  host_send_line(info);
-
+  // Optional debug: which local epoch second + local delta the capture used.
   if (EMIT_RX_UTC_LINE && rx_utc_valid) {
     char utc_info[64];
     snprintf(
@@ -2297,18 +2495,42 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     host_send_line(utc_info);
   }
 
-  if (!payload_info.timestamped || !rx_utc_valid) {
+  if (!rx_utc_valid) {
+    host_send_line("#INA");
     return;
   }
 
   const int64_t rx_time_us =
     rx_utc_second * (int64_t)EPOCH_US + (int64_t)delta_us;
-  const int64_t raw_tof_us =
-    rx_time_us - (int64_t)payload_info.tx_time_us;
-  const int64_t calibrated_tof_us =
-    raw_tof_us - (int64_t)RANGE_FIXED_DELAY_US;
-  const int64_t range_mm =
-    (calibrated_tof_us * SOUND_SPEED_MM_PER_S) / 1000000LL;
+
+  int64_t tx_time_us = 0;
+  if (!resolve_tx_time_us(
+        payload_info.tx_ss,
+        payload_info.tx_fraction_us,
+        rx_time_us,
+        &tx_time_us)) {
+    host_send_line("#INA");
+    return;
+  }
+
+  const int64_t tof_us = rx_time_us - tx_time_us;
+
+  // Reject physically impossible travel times instead of emitting them. A
+  // negative TOF or one beyond OWTT_MAX_PLAUSIBLE_TOF_US means the RxS
+  // capture was paired with the wrong #B decode (mispairs are quantized in
+  // whole TX periods) or a timing transient slipped through — surface it as
+  // a diagnostic, never as ranging data.
+  if (tof_us < 0 || tof_us > OWTT_MAX_PLAUSIBLE_TOF_US) {
+    char err[48];
+    snprintf(err, sizeof(err), "#E,I,TOF_IMPLAUSIBLE,%lld", (long long)tof_us);
+    host_send_line(err);
+    return;
+  }
+
+  // #I = absolute one-way travel time (TX stamp -> RX capture), in µs.
+  // Unlike the old local-delta #I, this is not bounded by the 1 s epoch.
+  snprintf(info, sizeof(info), "#I%lld", (long long)tof_us);
+  host_send_line(info);
 
   char lat[24] = {0};
   char lon[24] = {0};
@@ -2318,18 +2540,21 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     lon, sizeof(lon)
   );
 
+  const int64_t tx_ss_time_us =
+    (int64_t)payload_info.tx_ss * 1000000LL +
+    (int64_t)payload_info.tx_fraction_us;
+
   char row[320];
   snprintf(
     row,
     sizeof(row),
-    "#OWTT,%u,%s,%llu,%lld,%lld,%ld,%lld,%c,%lu,%lu,%c,%lu,%lu,%s,%s",
+    "#OWTT,%u,%s,%lld,%lld,%lld,%ld,%c,%lu,%lu,%c,%lu,%lu,%s,%s",
     (unsigned int)payload_info.sequence,
     payload_info.source_id,
-    (unsigned long long)payload_info.tx_time_us,
+    (long long)tx_ss_time_us,
     (long long)rx_time_us,
-    (long long)calibrated_tof_us,
+    (long long)tof_us,
     (long)delta_us,
-    (long long)range_mm,
     rx_timing_mode,
     (unsigned long)rx_holdover_age_s,
     (unsigned long)rx_gnss_age_ms,
@@ -2375,7 +2600,8 @@ static void emit_gnss_status(bool include_last_nmea)
     sizeof(msg),
     "#GNSS,%s,uart_baud=%lu,usb_open=%u,rx_bytes=%lu,tx_bytes=%lu,"
     "rx_age_ms=%lu,ubx_ok=%lu,ubx_bad=%lu,timeutc=%lu,nmea=%lu,"
-    "timing=%s,utc_valid=%u,epoch_unix_s=%lld,holdover_age_s=%lu",
+    "bridge_drops=%lu,timing=%s,utc_valid=%u,epoch_unix_s=%lld,"
+    "holdover_age_s=%lu",
     !have_rx ? "NO_DATA" : (activity_fresh ? "ACTIVE" : "STALE"),
     (unsigned long)gnss_uart_baud,
     (bool)GNSS_USB_SERIAL ? 1U : 0U,
@@ -2386,6 +2612,7 @@ static void emit_gnss_status(bool include_last_nmea)
     (unsigned long)gnss_ubx_bad_checksum_count,
     (unsigned long)gnss_timeutc_count,
     (unsigned long)gnss_nmea_line_count,
+    (unsigned long)gnss_bridge_drop_count,
     timing_mode_name(),
     current_epoch_utc_valid ? 1U : 0U,
     (long long)current_epoch_utc_second,
@@ -2696,7 +2923,9 @@ static bool handle_pending_config_modem_line(const char *line)
     return true;
   }
 
-  return true;
+  // Still waiting for #A / E — do not consume unrelated modem traffic
+  // (especially #B/#U), or OWTT ranging goes silent for the whole timeout.
+  return false;
 }
 
 static void check_pending_config_timeout()
@@ -2834,7 +3063,41 @@ static void gnss_enable_timeutc_uart1_ram()
   gnss_send_ubx(0x06, 0x8A, payload, sizeof(payload));
 }
 
-static void maybe_send_gnss_timeutc_config()
+static void gnss_set_uart1_baud_ram(uint32_t baud)
+{
+  // UBX-CFG-VALSET, RAM layer: CFG-UART1-BAUDRATE = 0x40520001 (U4).
+  uint8_t payload[] = {
+    0x00,             // version
+    0x01,             // layers: RAM
+    0x00, 0x00,       // reserved
+    0x01, 0x00, 0x52, 0x40, // key 0x40520001
+    (uint8_t)(baud & 0xFFU),
+    (uint8_t)((baud >> 8) & 0xFFU),
+    (uint8_t)((baud >> 16) & 0xFFU),
+    (uint8_t)((baud >> 24) & 0xFFU)
+  };
+
+  gnss_send_ubx(0x06, 0x8A, payload, sizeof(payload));
+}
+
+static void gnss_set_local_baud(uint32_t baud)
+{
+  GNSS_SERIAL.flush();
+  GNSS_SERIAL.end();
+  GNSS_SERIAL.begin(baud, SERIAL_8N1);
+  gnss_uart_apply_extra_buffers();
+  gnss_uart_baud = baud;
+  ubx_parser_reset();
+}
+
+// Boot / recovery configuration of the X20P UART1 link.
+//
+// Sequence: talk to the receiver at whatever baud Serial2 currently runs,
+// command UART1 up to GNSS_TARGET_BAUD (RAM-only — the receiver's stored
+// config is never rewritten), follow locally, then enable TIMEUTC output at
+// the new rate. If the receiver ever goes silent (power cycle reverts the
+// RAM baud), maybe_recover_gnss_link() walks the baud back and re-runs this.
+static void maybe_send_gnss_boot_config()
 {
   if (!GNSS_AUTO_ENABLE_TIMEUTC || gnss_timeutc_config_sent) {
     return;
@@ -2844,8 +3107,48 @@ static void maybe_send_gnss_timeutc_config()
     return;
   }
 
+  if (gnss_uart_baud != GNSS_TARGET_BAUD) {
+    gnss_set_uart1_baud_ram(GNSS_TARGET_BAUD);
+    gnss_set_local_baud(GNSS_TARGET_BAUD);
+    // Let the receiver switch and its first frames at the new rate arrive
+    // before sending the TIMEUTC enable.
+    gnss_timeutc_config_due_ms = millis() + 250UL;
+    return;
+  }
+
   gnss_enable_timeutc_uart1_ram();
   gnss_timeutc_config_sent = true;
+}
+
+static void maybe_recover_gnss_link()
+{
+  if (!gnss_timeutc_config_sent) {
+    return;
+  }
+
+  const uint32_t now_ms = millis();
+  const uint32_t silent_ms = (gnss_rx_byte_count != 0)
+    ? (uint32_t)(now_ms - gnss_last_rx_ms)
+    : (uint32_t)(now_ms);
+
+  if (silent_ms <= GNSS_LINK_SILENT_MS) {
+    return;
+  }
+
+  // Alternate between the target rate and the receiver's stored boot rate,
+  // re-arming the boot config each time; whichever baud produces bytes will
+  // then be re-configured up to the target.
+  const uint32_t next_baud = (gnss_uart_baud == GNSS_TARGET_BAUD)
+    ? GNSS_INITIAL_BAUD
+    : GNSS_TARGET_BAUD;
+  gnss_set_local_baud(next_baud);
+  gnss_last_rx_ms = now_ms;
+  gnss_timeutc_config_sent = false;
+  gnss_timeutc_config_due_ms = now_ms + 500UL;
+
+  char msg[48];
+  snprintf(msg, sizeof(msg), "#GNSS,RELINK,%lu", (unsigned long)next_baud);
+  host_send_line(msg);
 }
 
 static void maybe_follow_gnss_usb_baud()
@@ -2891,17 +3194,16 @@ static void service_gnss_bridge()
     }
   }
 
-  // X20P -> PC / u-center. Every byte is first observed by the passive UBX
-  // parser, then forwarded unchanged. If the second USB port is open but its
-  // TX buffer is temporarily full, stop reading Serial2 so bytes are not
-  // deliberately discarded from the transparent bridge.
+  // X20P -> PC / u-center. Every byte is ALWAYS consumed by the local
+  // NMEA/UBX parsers — PPS↔UTC labelling must never starve. Forwarding to the
+  // USB bridge is best-effort: if the host reader stalls (driver restart,
+  // hung process), bridge bytes are dropped and counted instead of blocking
+  // the timing core. A stalled reader previously froze UTC parsing entirely,
+  // and the delayed TIMEUTC burst afterwards could mislabel epochs by whole
+  // seconds (observed as multi-second TOF outliers).
   const bool gnss_usb_open = (bool)GNSS_USB_SERIAL;
 
   while (GNSS_SERIAL.available() > 0) {
-    if (gnss_usb_open && GNSS_USB_SERIAL.availableForWrite() <= 0) {
-      break;
-    }
-
     const int b = GNSS_SERIAL.read();
     if (b < 0) {
       break;
@@ -2913,9 +3215,33 @@ static void service_gnss_bridge()
     gnss_ubx_feed((uint8_t)b);
 
     if (gnss_usb_open) {
-      GNSS_USB_SERIAL.write((uint8_t)b);
+      if (GNSS_USB_SERIAL.availableForWrite() > 0) {
+        GNSS_USB_SERIAL.write((uint8_t)b);
+      } else {
+        gnss_bridge_drop_count++;
+      }
     }
   }
+}
+
+// =======================================================
+// ===================== E-INK STATUS ====================
+// =======================================================
+
+static void sync_owtt_epd_status()
+{
+  OwttEpdStatus s = {};
+  s.mode_char = mode_to_char(cfg.mode);
+  copy_id3(s.own_id, cfg.own_id);
+  s.timing_char = timing_mode_code(timing_mode);
+  s.holdover_age_s = holdover_age_s;
+  s.gnss_fresh = gnss_utc_is_fresh();
+  s.gps_valid = latest_gps_valid;
+  s.telem_valid = latest_telem_valid;
+  s.cfg_pending = pending_cfg.active;
+  strncpy(s.cfg_line, epd_cfg_line, sizeof(s.cfg_line) - 1);
+  s.cfg_line[sizeof(s.cfg_line) - 1] = '\0';
+  owtt_epd_set_status(s);
 }
 
 // =======================================================
@@ -2938,14 +3264,17 @@ void setup()
   pinMode(PIN_RXS_CAPTURE, INPUT);
   pinMode(PIN_PPS_CAPTURE, INPUT);
 
-  // TEMP DIAGNOSTIC: see GPT2_IRQHandler PPS-capture branch.
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWriteFast(LED_BUILTIN, LOW);
+  // Pin 13 is SPI SCK for the e-ink panel (shared with LED_BUILTIN).
+  // Do not drive it as a GPIO LED.
 
   gpt2_extclk_capture_init_1mhz();
 
   // Give the X20P time to boot before enabling UBX-NAV-TIMEUTC.
   gnss_timeutc_config_due_ms = millis() + 1000UL;
+
+  sync_owtt_epd_status();
+  owtt_epd_begin();
+  owtt_epd_service();
 }
 
 void loop()
@@ -2954,7 +3283,8 @@ void loop()
 
   // Keep the X20P bridge responsive and passively parse UTC messages.
   service_gnss_bridge();
-  maybe_send_gnss_timeutc_config();
+  maybe_send_gnss_boot_config();
+  maybe_recover_gnss_link();
 
   // First: latch timing events so delta_t is independent of serial delays.
   process_timing_events();
@@ -2982,4 +3312,8 @@ void loop()
   // Automatic transmitter broadcast runs after host commands,
   // so manual host commands have priority over scheduled GPS TX.
   execute_auto_tx_if_due();
+
+  // E-ink status: coalesce full refreshes (see EPD_MIN_REFRESH_MS).
+  sync_owtt_epd_status();
+  owtt_epd_service();
 }
