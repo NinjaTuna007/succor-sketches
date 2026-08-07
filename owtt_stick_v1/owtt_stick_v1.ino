@@ -488,6 +488,10 @@ static uint32_t gnss_last_nmea_ms = 0;
 // the link supervisor — raw rx_bytes alone can be a stuck-low / wrong-baud
 // null stream that must not look healthy.
 static uint32_t gnss_last_good_frame_ms = 0;
+// When the current local UART baud listen window started (boot, RELINK, or
+// local baud change). Silence age must be measured from this when no frame
+// has decoded yet — using millis()-since-boot made RELINK fire every loop.
+static uint32_t gnss_link_epoch_ms = 0;
 static char gnss_last_nmea[GNSS_NMEA_MAX] = {0};
 
 static bool gnss_live_debug_enabled = false;
@@ -2691,6 +2695,8 @@ static bool handle_gnss_debug_command(const char *line)
   gnss_uart_apply_extra_buffers();
   gnss_uart_baud = (uint32_t)requested;
     ubx_parser_reset();
+    gnss_last_good_frame_ms = 0;
+    gnss_link_epoch_ms = millis();
 
     // Re-send the RAM-only TIMEUTC output configuration at the newly selected
     // baud. This does not change the X20P's own stored UART baud.
@@ -3102,22 +3108,36 @@ static void gnss_set_local_baud(uint32_t baud)
   gnss_uart_apply_extra_buffers();
   gnss_uart_baud = baud;
   ubx_parser_reset();
+  // Frames decoded at the previous baud do not prove this listen window.
+  gnss_last_good_frame_ms = 0;
+  gnss_link_epoch_ms = millis();
+}
+
+static bool gnss_have_recent_good_frame(uint32_t now_ms)
+{
+  return gnss_last_good_frame_ms != 0 &&
+         (uint32_t)(now_ms - gnss_last_good_frame_ms) <= GNSS_LINK_SILENT_MS;
 }
 
 // Boot / recovery configuration of the X20P UART1 link.
 //
-// Sequence: talk to the receiver at whatever baud Serial2 currently runs,
-// command UART1 up to GNSS_TARGET_BAUD (RAM-only — the receiver's stored
-// config is never rewritten), follow locally, then enable TIMEUTC output at
-// the new rate. If the receiver ever goes silent (power cycle reverts the
-// RAM baud), maybe_recover_gnss_link() walks the baud back and re-runs this.
+// Sequence: listen at the current probe baud until a framed UBX/NMEA proves
+// the link, *then* command UART1 up to GNSS_TARGET_BAUD (RAM-only), follow
+// locally, wait for framed traffic at the new rate, and enable TIMEUTC.
+// Blindly jumping to 921600 before any decode caused RELINK spam when the
+// X20P was still at 38400/115200 (VALSET never heard).
 static void maybe_send_gnss_boot_config()
 {
   if (!GNSS_AUTO_ENABLE_TIMEUTC || gnss_timeutc_config_sent) {
     return;
   }
 
-  if ((int32_t)(millis() - gnss_timeutc_config_due_ms) < 0) {
+  const uint32_t now_ms = millis();
+  if ((int32_t)(now_ms - gnss_timeutc_config_due_ms) < 0) {
+    return;
+  }
+
+  if (!gnss_have_recent_good_frame(now_ms)) {
     return;
   }
 
@@ -3136,16 +3156,20 @@ static void maybe_send_gnss_boot_config()
 
 static void maybe_recover_gnss_link()
 {
-  if (!gnss_timeutc_config_sent) {
+  const uint32_t now_ms = millis();
+
+  // Give boot/RELINK settling time before declaring the probe baud dead.
+  if ((int32_t)(now_ms - gnss_timeutc_config_due_ms) < 0) {
     return;
   }
 
-  const uint32_t now_ms = millis();
   // Require a recently *decoded* frame. A wrong baud (or TX stuck low) still
-  // produces rx_bytes and would never look "silent".
-  const bool have_good_frame = (gnss_last_good_frame_ms != 0);
-  const uint32_t good_age_ms =
-    have_good_frame ? (uint32_t)(now_ms - gnss_last_good_frame_ms) : now_ms;
+  // produces rx_bytes and would never look "silent". If nothing has decoded
+  // yet in this listen window, age from gnss_link_epoch_ms — never from
+  // millis()-since-boot (that made RELINK fire every loop after 3 s).
+  const uint32_t ref_ms =
+    (gnss_last_good_frame_ms != 0) ? gnss_last_good_frame_ms : gnss_link_epoch_ms;
+  const uint32_t good_age_ms = (uint32_t)(now_ms - ref_ms);
 
   if (good_age_ms <= GNSS_LINK_SILENT_MS) {
     return;
@@ -3165,7 +3189,6 @@ static void maybe_recover_gnss_link()
 
   gnss_set_local_baud(next_baud);
   gnss_last_rx_ms = now_ms;
-  gnss_last_good_frame_ms = 0;
   gnss_timeutc_config_sent = false;
   gnss_timeutc_config_due_ms = now_ms + 500UL;
 
@@ -3195,6 +3218,8 @@ static void maybe_follow_gnss_usb_baud()
 
   gnss_uart_baud = requested_baud;
   ubx_parser_reset();
+  gnss_last_good_frame_ms = 0;
+  gnss_link_epoch_ms = millis();
 }
 
 static void gnss_uart_apply_extra_buffers()
@@ -3282,6 +3307,9 @@ void setup()
   MODEM_SERIAL.begin(MODEM_BAUD, SERIAL_8N1);
   GNSS_SERIAL.begin(GNSS_INITIAL_BAUD, SERIAL_8N1);
   gnss_uart_baud = GNSS_INITIAL_BAUD;
+  gnss_uart_apply_extra_buffers();
+  gnss_last_good_frame_ms = 0;
+  gnss_link_epoch_ms = millis();
 
   pinMode(PIN_OCXO, INPUT);
   pinMode(PIN_RXS_CAPTURE, INPUT);
