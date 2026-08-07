@@ -1,1 +1,21 @@
+# macOS
 .DS_Store
+
+# Arduino CLI / Arduino IDE build outputs (any sketch)
+**/build/
+*.hex
+*.elf
+*.eep
+*.lst
+*.sym
+*.bin
+*.with_bootloader.hex
+
+# Local Arduino/Teensy IDE debris
+*.d
+*.o
+*.a
+.vscode/
+.idea/
+*.swp
+*~
