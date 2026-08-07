@@ -126,7 +126,8 @@
 //      Returns the maintained epoch UTC and reports PPS_LOCKED/HOLDOVER.
 //
 // Experiment controls:
-//   $ZPAYLOADTTL=0    Keep the latest $G/$K payload indefinitely (default).
+//   $ZPAYLOADTTL=1    Expire latest $G/$K after 1 PPS/holdover epoch (default).
+//   $ZPAYLOADTTL=0    Keep the latest payload indefinitely (bench/debug only).
 //   $ZPAYLOADTTL=N    Expire it after N PPS/holdover epochs.
 //   $ZTXWARN=1/0      Enable/disable one-shot TX warnings (default off).
 //   $ZOWTTHEADER?     Reprint the #OWTT CSV column header.
@@ -193,17 +194,20 @@
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
 
-// Baud the X20P boots at (its stored UART1 config). The Teensy opens Serial2
-// here, then immediately raises UART1 to GNSS_TARGET_BAUD (RAM-only VALSET)
-// and follows. 115200 was a TIMEUTC latency bottleneck: NAV output, config
-// replies and RTCM share this UART, and queueing pushed TIMEUTC delivery past
-// the next PPS edge (whole-second label ambiguity).
-static constexpr uint32_t GNSS_INITIAL_BAUD = 115200;
+// Baud a stock X20P boots at (factory UART1). The Teensy opens Serial2 here,
+// then raises UART1 to GNSS_TARGET_BAUD (RAM-only VALSET) and follows.
+// Fresh modules speak 38400; some older sticks may still have 115200 stored —
+// maybe_recover_gnss_link() walks both. Staying at 115200 was a TIMEUTC
+// latency bottleneck: NAV, config replies and RTCM share this UART, and
+// queueing pushed TIMEUTC past the next PPS edge (whole-second ambiguity).
+static constexpr uint32_t GNSS_INITIAL_BAUD = 38400;
+// Alternate stored baud seen on previously-provisioned sticks.
+static constexpr uint32_t GNSS_FALLBACK_BAUD = 115200;
 // Max supported UART1 rate on the X20P (u-blox interface limit).
 static constexpr uint32_t GNSS_TARGET_BAUD = 921600;
-// Link supervisor: if the receiver goes silent this long (e.g. it power
-// cycled and reverted to its stored baud), step the local baud and re-apply
-// the RAM config until bytes flow again.
+// Link supervisor: if no *valid* UBX/NMEA arrives this long (silent line, or
+// a baud mismatch that spews unframed noise/nulls), step the local baud and
+// re-apply the RAM config. Byte activity alone is not "healthy".
 static constexpr uint32_t GNSS_LINK_SILENT_MS = 3000UL;
 
 // Extra HardwareSerial (Serial2) buffering for the X20P bridge.
@@ -222,7 +226,7 @@ static void gnss_uart_apply_extra_buffers();
 // A terminal program can report 9600 as its USB CDC baud even though USB CDC
 // itself has no physical baud rate. If this option is true, opening the GNSS
 // USB port with `screen` at 9600 would also switch Serial2 to 9600 and make a
-// 115200-baud X20P appear silent. Enable this only for service tools that must
+// factory 38400-baud X20P appear silent. Enable this only for service tools that must
 // intentionally change the receiver UART baud, such as some firmware-update
 // workflows.
 static constexpr bool GNSS_FOLLOW_USB_BAUD = false;
@@ -349,10 +353,10 @@ static size_t latest_gps_len = 0;
 static bool latest_gps_valid = false;
 
 // Payload lifetime in timing epochs. A value of 0 means the last valid GPS or
-// telemetry payload remains valid indefinitely. This experiment build boots
-// with infinite lifetime so one $G command can drive a long test. Change at
-// runtime with $ZPAYLOADTTL=<epochs>.
-static uint32_t payload_valid_epochs = 0;
+// telemetry payload remains valid indefinitely. Default is 1 epoch (~1 s with
+// PPS) so a dead host / silent $G stream cannot keep a stale position on the
+// air. Override at runtime with $ZPAYLOADTTL=<epochs> (ROS leader sets this).
+static uint32_t payload_valid_epochs = 1;
 
 static uint32_t latest_gps_epoch_count = 0;
 
@@ -480,6 +484,10 @@ static uint32_t gnss_timeutc_count = 0;
 static uint32_t gnss_bridge_drop_count = 0;
 static uint32_t gnss_nmea_line_count = 0;
 static uint32_t gnss_last_nmea_ms = 0;
+// Last millis() a framed UBX or NMEA message decoded successfully. Used by
+// the link supervisor — raw rx_bytes alone can be a stuck-low / wrong-baud
+// null stream that must not look healthy.
+static uint32_t gnss_last_good_frame_ms = 0;
 static char gnss_last_nmea[GNSS_NMEA_MAX] = {0};
 
 static bool gnss_live_debug_enabled = false;
@@ -1288,6 +1296,7 @@ static void gnss_ubx_feed(uint8_t b)
 
       if (checksum_ok) {
         gnss_ubx_ok_count++;
+        gnss_last_good_frame_ms = millis();
 
         if (gnss_ubx.msg_class == 0x01U &&
             gnss_ubx.msg_id == 0x21U &&
@@ -1328,6 +1337,7 @@ static void gnss_nmea_feed(uint8_t b)
       gnss_last_nmea[sizeof(gnss_last_nmea) - 1] = '\0';
       gnss_nmea_line_count++;
       gnss_last_nmea_ms = millis();
+      gnss_last_good_frame_ms = gnss_last_nmea_ms;
     }
 
     gnss_nmea.active = false;
@@ -1569,6 +1579,8 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     latest_gps_valid = false;
     latest_gps_len = 0;
     tx_last_warning = TX_WARN_NONE;
+    // Host $G/$K went stale — paint red "HOST SILENT" without waiting the e-ink gate.
+    owtt_epd_request_immediate();
   }
 
   if (payload_valid_epochs != 0 &&
@@ -1577,6 +1589,8 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     latest_telem_valid = false;
     latest_telem_len = 0;
     tx_last_warning = TX_WARN_NONE;
+    // Host $G/$K went stale — paint red "HOST SILENT" without waiting the e-ink gate.
+    owtt_epd_request_immediate();
   }
 
   if (real_pps) {
@@ -3127,22 +3141,31 @@ static void maybe_recover_gnss_link()
   }
 
   const uint32_t now_ms = millis();
-  const uint32_t silent_ms = (gnss_rx_byte_count != 0)
-    ? (uint32_t)(now_ms - gnss_last_rx_ms)
-    : (uint32_t)(now_ms);
+  // Require a recently *decoded* frame. A wrong baud (or TX stuck low) still
+  // produces rx_bytes and would never look "silent".
+  const bool have_good_frame = (gnss_last_good_frame_ms != 0);
+  const uint32_t good_age_ms =
+    have_good_frame ? (uint32_t)(now_ms - gnss_last_good_frame_ms) : now_ms;
 
-  if (silent_ms <= GNSS_LINK_SILENT_MS) {
+  if (good_age_ms <= GNSS_LINK_SILENT_MS) {
     return;
   }
 
-  // Alternate between the target rate and the receiver's stored boot rate,
-  // re-arming the boot config each time; whichever baud produces bytes will
-  // then be re-configured up to the target.
-  const uint32_t next_baud = (gnss_uart_baud == GNSS_TARGET_BAUD)
-    ? GNSS_INITIAL_BAUD
-    : GNSS_TARGET_BAUD;
+  // Walk factory → previously-provisioned → target, then repeat. Boot config
+  // re-arms on the baud that finally yields framed traffic and bumps UART1
+  // up to GNSS_TARGET_BAUD in RAM.
+  uint32_t next_baud;
+  if (gnss_uart_baud == GNSS_TARGET_BAUD) {
+    next_baud = GNSS_INITIAL_BAUD;
+  } else if (gnss_uart_baud == GNSS_INITIAL_BAUD) {
+    next_baud = GNSS_FALLBACK_BAUD;
+  } else {
+    next_baud = GNSS_TARGET_BAUD;
+  }
+
   gnss_set_local_baud(next_baud);
   gnss_last_rx_ms = now_ms;
+  gnss_last_good_frame_ms = 0;
   gnss_timeutc_config_sent = false;
   gnss_timeutc_config_due_ms = now_ms + 500UL;
 

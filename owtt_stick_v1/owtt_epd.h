@@ -3,7 +3,8 @@
 // Landscape 3-line glance UI. Full-screen fill encodes severity:
 //   white = OK, red = needs attention, black = offline / no link.
 // Pins match eink_test. Full refreshes are coalesced: dirty flag +
-// EPD_MIN_REFRESH_MS (default 180s per Adafruit guidance).
+// EPD_MIN_REFRESH_MS (default 180s per Adafruit guidance). Mode/id/config/
+// timing/severity changes use the shorter EPD_PRIORITY_REFRESH_MS (~20s).
 //
 // display.display() blocks ~13 s on this panel (BUSY pin unwired). That
 // call runs on a TeensyThreads worker so the OWTT main loop never stalls.
@@ -19,9 +20,14 @@
 #define EPD_MIN_REFRESH_MS 180000UL
 #endif
 
-// Floor between forced severity-change refreshes (full frame ~13s).
+// Floor between priority refreshes (full frame ~13s): severity colour,
+// mode/id (W/R/T + modem address), config outcome, or timing role change.
+// Routine telemetry churn (gps/telem flags) still waits EPD_MIN_REFRESH_MS.
 #ifndef EPD_SEVERITY_REFRESH_MS
 #define EPD_SEVERITY_REFRESH_MS 20000UL
+#endif
+#ifndef EPD_PRIORITY_REFRESH_MS
+#define EPD_PRIORITY_REFRESH_MS EPD_SEVERITY_REFRESH_MS
 #endif
 
 struct OwttEpdStatus {
@@ -39,4 +45,6 @@ struct OwttEpdStatus {
 void owtt_epd_begin();
 void owtt_epd_set_status(const OwttEpdStatus &status);
 void owtt_epd_mark_dirty();
+// Mark dirty and bypass the min-interval gate (next service() will queue a paint).
+void owtt_epd_request_immediate();
 void owtt_epd_service();

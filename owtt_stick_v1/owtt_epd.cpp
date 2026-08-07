@@ -61,6 +61,12 @@ static bool cfg_busy(const OwttEpdStatus &s)
   return s.cfg_pending || strcmp(s.cfg_line, "pending") == 0;
 }
 
+// Transmitter with no live host $G/$K payload — treat like GNSS death for UI.
+static bool host_payload_dead(const OwttEpdStatus &s)
+{
+  return s.mode_char == 'T' && !s.gps_valid && !s.telem_valid;
+}
+
 // Live severity (not MCU-crash detection — panel only shows last paint).
 static EpdSeverity severity_of(const OwttEpdStatus &s)
 {
@@ -69,10 +75,11 @@ static EpdSeverity severity_of(const OwttEpdStatus &s)
     return EPD_SEV_OFFLINE;
   }
 
-  // Holdover, waiting for PPS, stale GNSS, or config trouble.
+  // Holdover, waiting for PPS, stale GNSS/host payload, or config trouble.
   if (s.timing_char == 'H' ||
       s.timing_char == 'W' ||
       !s.gnss_fresh ||
+      host_payload_dead(s) ||
       cfg_failed(s) ||
       cfg_busy(s)) {
     return EPD_SEV_ATTENTION;
@@ -93,6 +100,22 @@ static bool status_equal(const OwttEpdStatus &a, const OwttEpdStatus &b)
          a.telem_valid == b.telem_valid &&
          a.cfg_pending == b.cfg_pending &&
          strcmp(a.cfg_line, b.cfg_line) == 0;
+}
+
+// Mode/id/config/timing/GNSS-or-host-payload health are operator-visible —
+// don't sit on the 180s lifetime gate.
+static bool priority_fields_changed(
+  const OwttEpdStatus &painted,
+  const OwttEpdStatus &pending)
+{
+  return painted.mode_char != pending.mode_char ||
+         strcmp(painted.own_id, pending.own_id) != 0 ||
+         painted.timing_char != pending.timing_char ||
+         painted.gnss_fresh != pending.gnss_fresh ||
+         painted.gps_valid != pending.gps_valid ||
+         painted.telem_valid != pending.telem_valid ||
+         painted.cfg_pending != pending.cfg_pending ||
+         strcmp(painted.cfg_line, pending.cfg_line) != 0;
 }
 
 static void render_status(const OwttEpdStatus &s)
@@ -149,6 +172,9 @@ static void render_status(const OwttEpdStatus &s)
     }
   } else if (!s.gnss_fresh) {
     snprintf(line, sizeof(line), "GNSS DEAD");
+  } else if (host_payload_dead(s)) {
+    // Transmitter with expired/missing host $G/$K — not the X20P link.
+    snprintf(line, sizeof(line), "HOST SILENT");
   } else if (s.mode_char == 'T') {
     if (s.telem_valid) {
       snprintf(line, sizeof(line), "GNSS OK TEL");
@@ -254,6 +280,12 @@ void owtt_epd_mark_dirty()
   epd_dirty = true;
 }
 
+void owtt_epd_request_immediate()
+{
+  epd_dirty = true;
+  epd_force_next = true;
+}
+
 void owtt_epd_service()
 {
   if (!epd_ready || !epd_dirty || !have_pending) {
@@ -274,10 +306,15 @@ void owtt_epd_service()
   const EpdSeverity painted_sev =
     have_painted ? severity_of(painted_status) : EPD_SEV_OFFLINE;
   const bool severity_changed = !have_painted || pending_sev != painted_sev;
-  // Escaping the black boot frame (or any severity change) must not wait
-  // the full 180s lifetime gate — only a short floor around one refresh.
-  const uint32_t min_ms = severity_changed
-    ? EPD_SEVERITY_REFRESH_MS
+  const bool priority_changed =
+    !have_painted ||
+    severity_changed ||
+    priority_fields_changed(painted_status, pending_status);
+  // Escaping the black boot frame, severity colour, or mode/id/config/timing
+  // must not wait the full 180s lifetime gate — only a short floor around one
+  // refresh (~20s, longer than the ~13s tricolor paint).
+  const uint32_t min_ms = priority_changed
+    ? EPD_PRIORITY_REFRESH_MS
     : EPD_MIN_REFRESH_MS;
 
   if (!epd_force_next) {
@@ -301,6 +338,7 @@ void owtt_epd_service()
 void owtt_epd_begin() {}
 void owtt_epd_set_status(const OwttEpdStatus &) {}
 void owtt_epd_mark_dirty() {}
+void owtt_epd_request_immediate() {}
 void owtt_epd_service() {}
 
 #endif
