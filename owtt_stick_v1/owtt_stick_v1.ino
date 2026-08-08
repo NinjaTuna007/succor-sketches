@@ -102,14 +102,18 @@
 //   - If PPS disappears, GPT2 compare keeps virtual 1-second epochs
 //     using the OCXO holdover clock.
 //
-// Receiver output order:
+// Receiver output order (after a timed GPS/TEL modem line, when UTC is valid):
 //   1. Forward raw modem line to host, e.g.
 //      #Bxxxnndd...
 //      #B00722<lat>,<lon>
-//   2. If that line contains GPS coordinates/telemetry, send timing info:
-//        #I<delta_us>
-//   3. When the RxS capture has an absolute UTC epoch label, also send:
+//   2. Optional UTC-labelled capture residual (EMIT_RX_UTC_LINE):
 //        #J<rx_utc_unix_s>,<delta_us>
+//   3. Absolute one-way travel time (TX stamp -> RX capture), for ROS ranging:
+//        #I<tof_us>
+//   4. Full CSV context row for bags / post-analysis:
+//        #OWTT,<seq>,<src>,<tx_us>,<rx_us>,<tof_us>,<delta_us>,...
+//   If UTC is missing or TOF is implausible, emit #INA / #E,I,... instead of
+//   #I/#OWTT (see emit path after extract_timed_payload_from_modem_line).
 //
 // GNSS diagnostics from the first USB/host port:
 //   $ZGNSS?
