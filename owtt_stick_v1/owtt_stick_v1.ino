@@ -98,9 +98,11 @@
 //   - External 10 MHz OCXO clock into pin 14.
 //   - PPS into pin 40 for synchronization of vehicles.
 //   - RxS flag into pin 15 for acoustic packet/header detection.
-//   - GPT2 runs at 1 MHz, so 1 tick = 1 us.
+//   - GPT2 runs at a nominal 1 MHz, so 1 tick is ~1 us. The true tick rate is
+//     measured against PPS (see OCXO RATE CALIBRATION) because the oscillator's
+//     calibration tolerance alone is enough to dominate holdover error.
 //   - If PPS disappears, GPT2 compare keeps virtual 1-second epochs
-//     using the OCXO holdover clock.
+//     using the OCXO holdover clock, advanced at the measured rate.
 //
 // Receiver output order (after a timed GPS/TEL modem line, when UTC is valid):
 //   1. Forward raw modem line to host, e.g.
@@ -147,6 +149,28 @@
 //                         Re-send =0 then =N to restart the countdown (e.g. ROS
 //                         driver restart mid-run).
 //   $ZIGNOREPPSAFTER?     Report the configured delay (seconds, 0 = disabled).
+//
+//   Either form of $ZIGNOREPPSAFTER= also refreshes the OCXO rate from every
+//   PPS edge collected so far and echoes #OCXOCAL, so the rate carried into
+//   holdover is the freshest available and is logged next to the arming line.
+//   A rate pinned with $ZOCXOCAL=<ppb> is left untouched.
+//
+// OCXO rate calibration:
+//   $ZOCXOCAL?        Report the current rate as
+//                       #OCXOCAL,<N|M|F>,<ppb>,<ticks_per_s>,<samples>,<span_s>,<pairs>
+//                     N = nominal (no measurement yet), M = measured from PPS,
+//                     F = pinned by command. ppb is the offset from nominal.
+//   $ZOCXOCAL=AUTO    Resume estimating from PPS (default). Clears the ring and
+//                     falls back to nominal until enough edges accumulate.
+//   $ZOCXOCAL=<ppb>   Pin the rate to a known offset and stop estimating, e.g.
+//                     from a previous dive. $ZOCXOCAL=0 pins nominal 1e6 ticks
+//                     per second, reproducing the pre-calibration behaviour for
+//                     A/B holdover comparisons.
+//
+//   Calibration needs roughly a minute of PPS lock before it improves on
+//   nominal, and keeps improving until the ring fills (~8.5 min). #OCXOCAL is
+//   emitted on the first measurement and whenever the rate moves by >=5 ppb, so
+//   the applied rate is recoverable from the bag.
 //
 //   $Z commands are handled even while a $Y modem config is pending, so the
 //   host may send this right after the $Y receiver/transmitter config.
@@ -283,9 +307,46 @@ static constexpr uint32_t GNSS_ACTIVITY_FRESH_MS = 2000UL;
 static constexpr uint32_t GNSS_DEBUG_PERIOD_MS = 1000UL;
 static constexpr size_t GNSS_NMEA_MAX = 160;
 
-// OCXO Holdover constants
+// OCXO Holdover constants.
+//
+// EPOCH_US is microseconds per second in the SI sense: it only ever converts a
+// second label into a timestamp. It is *not* interchangeable with the number of
+// OCXO ticks in a second, which is measured at runtime; see epoch_ticks() and
+// the OCXO RATE CALIBRATION section.
 static constexpr uint32_t EPOCH_US       = 1000000UL;
 static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;
+
+// Nominal OCXO ticks in one true second: 10 MHz / (GPT2_PRESCALER_VALUE + 1).
+// Only the starting point; the measured rate replaces it once PPS is available.
+static constexpr uint32_t EPOCH_TICKS_NOM = 1000000UL;
+
+// PPS rate-calibration ring.
+//
+// A rate estimate resolves one counter tick divided by the pair baseline, so a
+// 1 us tick over a 256 s baseline is 3.9 ppb, while counting ticks between
+// *adjacent* edges would only resolve 1 ppm. MIN_SAMPLES already gives a usable
+// ~31 ppb estimate about a minute after lock, improving as the ring fills.
+static constexpr uint16_t PPS_CAL_RING_LEN     = 512;
+static constexpr uint16_t PPS_CAL_MIN_SAMPLES  = 64;
+// Re-estimate every N real edges rather than every edge; the sort is O(n^2).
+static constexpr uint16_t PPS_CAL_UPDATE_EDGES = 8;
+// Discard pairs spanning longer than this: 2^32 ticks is ~4295 s, past which a
+// tick difference is ambiguous. A full ring only spans PPS_CAL_RING_LEN
+// seconds, so this is unreachable unless the ring straddles an outage, and it
+// leaves 2x headroom on the 64-bit slope numerator.
+static constexpr uint32_t PPS_CAL_MAX_PAIR_EPOCHS = 2048UL;
+// Reject estimates further than this from nominal. The AOC2012 allows +-500 ppb
+// of calibration tolerance plus +-700 ppb of Vc pullability, so anything beyond
+// 2 ppm is a bad capture train rather than a real oscillator.
+static constexpr int32_t OCXO_RATE_MAX_PPB = 2000;
+// Only announce a new rate when it actually moved, to keep #OCXOCAL out of the
+// per-second traffic.
+static constexpr int32_t OCXO_CAL_REPORT_PPB = 5;
+// A PPS edge is only trusted for calibration while the GNSS vouches for its
+// own time solution. An unlocked receiver still emits PPS, but derived from its
+// internal oscillator, which would calibrate the OCXO against nothing.
+static constexpr uint32_t PPS_CAL_MAX_TACC_NS  = 1000000UL;
+static constexpr uint32_t PPS_CAL_UTC_FRESH_MS = 3000UL;
 
 // Config timeout constant
 static constexpr uint32_t CONFIG_ADDR_TIMEOUT_MS = 5000;
@@ -839,10 +900,18 @@ static volatile bool cmp_pending = false;
 static volatile uint32_t cmp_stamp = 0;
 
 // Used for OCXO holdover.
-// Compare interrupt fires every EPOCH_US = 1 second.
+// Compare interrupt fires once per measured second.
 // The transmitter period is handled separately by counting epochs:
 //   next_tx_epoch_count = epoch_count + cfg.period_pps
-static volatile uint32_t gpt2_next_compare = 0;
+//
+// Tick position of the next virtual epoch, Q32.32. The fractional part is what
+// lets the holdover train run at the measured rate: a true second is around
+// 1000000.05 ticks, so re-truncating to whole ticks every epoch would put a
+// 1 ppm rounding error back in and undo the calibration.
+//
+// The integer part occupies bits 32..63, so uint64 wraparound is exactly the
+// mod-2^32 arithmetic the free-running counter needs.
+static volatile uint64_t next_compare_q32 = 0;
 
 enum TimingMode : uint8_t {
   TIMING_WAIT_PPS   = 0,
@@ -874,6 +943,311 @@ static uint32_t pending_delta_holdover_age_s = 0;
 static uint32_t pending_delta_gnss_age_ms = 0;
 static char pending_delta_timing_mode = 'W';
 
+// =======================================================
+// ============= OCXO RATE CALIBRATION ===================
+// =======================================================
+//
+// The epoch machinery used to assume the OCXO produced exactly EPOCH_TICKS_NOM
+// ticks per second. It does not: the AOC2012 is specified to +-500 ppb of
+// initial calibration tolerance (typ. <+-300 ppb), and the field unit measured
+// -48 ppb, which is -0.26 m/h of range error at 1481 m/s. PPS re-pinned the
+// phase of each epoch every second but nothing ever estimated the *rate*, so
+// the full offset reappeared as a ramp the moment PPS was lost.
+//
+// Every real PPS edge is already timestamped by the same GPT2 capture unit used
+// for acoustic arrivals, so the rate is measurable for free while the vehicle is
+// on the surface. Holdover then advances at the measured rate.
+//
+// Estimator: the median of pairwise slopes
+//     (t[k + half] - t[k]) / (epoch[k + half] - epoch[k])
+// over the retained edges. Two properties matter.
+//
+// Baseline: each pair spans half the ring, i.e. hundreds of seconds, and a
+// slope resolves one tick divided by its baseline. Slopes between *adjacent*
+// edges would resolve only 1 ppm, and since a true second is ~1000000.05 ticks,
+// nearly every adjacent count reads exactly 1000000 with a rare 1000001. Their
+// median is 1000000 exactly, discarding the entire signal, so short baselines
+// are not merely coarse but blind.
+//
+// Robustness: the median (rather than a least-squares fit) keeps one glitched
+// capture, a spurious edge, or a PPS outage from moving the rate at all.
+//
+// Differencing epoch_count rather than ring position means a missed or dropped
+// edge shortens the pair by whole seconds instead of biasing the slope.
+
+struct PpsCalSample {
+  uint32_t tick;   // GPT2 capture value of the edge
+  uint32_t epoch;  // epoch_count at that edge, so gaps are exact
+};
+
+static PpsCalSample pps_cal_ring[PPS_CAL_RING_LEN];
+static uint16_t pps_cal_head = 0;
+static uint16_t pps_cal_count = 0;
+static uint16_t pps_cal_since_update = 0;
+
+// Scratch for the median. Static rather than automatic: 2 KB does not belong on
+// the main-loop stack.
+static uint64_t pps_cal_slopes[PPS_CAL_RING_LEN / 2];
+
+// Measured OCXO ticks in one true second, Q32.32.
+static volatile uint64_t epoch_step_q32 = (uint64_t)EPOCH_TICKS_NOM << 32;
+// Same measurement rounded to whole ticks, for deciding which epoch a capture
+// belongs to. Sub-tick precision is irrelevant there.
+static uint32_t epoch_ticks_int = EPOCH_TICKS_NOM;
+// Same measurement as a signed fractional offset from nominal, for reporting
+// and for converting tick intervals to true microseconds.
+static int32_t ocxo_rate_ppb = 0;
+
+enum OcxoCalState : uint8_t {
+  OCXO_CAL_NOMINAL  = 0, // no measurement yet, running on EPOCH_TICKS_NOM
+  OCXO_CAL_MEASURED = 1, // rate estimated from the PPS ring
+  OCXO_CAL_MANUAL   = 2  // rate pinned by $ZOCXOCAL=<ppb>
+};
+
+static OcxoCalState ocxo_cal_state = OCXO_CAL_NOMINAL;
+static bool ocxo_cal_auto = true;
+static uint32_t ocxo_cal_span_s = 0;
+static uint16_t ocxo_cal_pairs = 0;
+
+// Explicit prototypes required for Arduino's .ino preprocessor, for the same
+// reason as timing_mode_code() below: without them Arduino auto-generates
+// prototypes above the PpsCalSample/OcxoCalState declarations.
+static void ocxo_apply_rate(uint64_t step_q32, OcxoCalState state);
+static const PpsCalSample *pps_cal_at(uint16_t age_index);
+
+// Whole OCXO ticks in one true second.
+static inline uint32_t epoch_ticks()
+{
+  return epoch_ticks_int;
+}
+
+// Convert a counter interval to true microseconds. Ticks are only nominally
+// microseconds; at the measured rate a 1 s interval is off by ocxo_rate_ppb ns.
+static inline uint32_t ticks_to_us(uint32_t ticks)
+{
+  const int64_t corr =
+    ((int64_t)ticks * (int64_t)ocxo_rate_ppb) / 1000000000LL;
+  return (uint32_t)((int64_t)ticks - corr);
+}
+
+// ppb = (step - nominal) / nominal * 1e9. The second factor is exactly 1000
+// because the prescaled tick is one nominal microsecond. Rounded rather than
+// truncated so that a rate pinned by $ZOCXOCAL=<ppb> reads back unchanged.
+static int32_t ocxo_ppb_from_step(uint64_t step_q32)
+{
+  const int64_t diff_q32 =
+    (int64_t)step_q32 - ((int64_t)EPOCH_TICKS_NOM << 32);
+  const int64_t scaled = diff_q32 * 1000LL;
+  const int64_t half = (int64_t)1 << 31;
+  return (int32_t)(((scaled >= 0) ? (scaled + half) : (scaled - half)) /
+                   ((int64_t)1 << 32));
+}
+
+static uint64_t ocxo_step_from_ppb(int32_t ppb)
+{
+  const int64_t diff_q32 = ((int64_t)ppb * ((int64_t)1 << 32)) / 1000LL;
+  return (uint64_t)(((int64_t)EPOCH_TICKS_NOM << 32) + diff_q32);
+}
+
+static void ocxo_apply_rate(uint64_t step_q32, OcxoCalState state)
+{
+  // The compare ISR reads epoch_step_q32 as two words; block it across the
+  // update so it can never see a torn value.
+  noInterrupts();
+  epoch_step_q32 = step_q32;
+  interrupts();
+
+  epoch_ticks_int = (uint32_t)((step_q32 + 0x80000000ULL) >> 32);
+  ocxo_rate_ppb = ocxo_ppb_from_step(step_q32);
+  ocxo_cal_state = state;
+}
+
+static void ocxo_cal_report()
+{
+  const uint64_t step = epoch_step_q32;
+  const uint32_t frac_e6 =
+    (uint32_t)(((step & 0xFFFFFFFFULL) * 1000000ULL) >> 32);
+
+  char state_char = 'N';
+  if (ocxo_cal_state == OCXO_CAL_MEASURED) {
+    state_char = 'M';
+  } else if (ocxo_cal_state == OCXO_CAL_MANUAL) {
+    state_char = 'F';
+  }
+
+  char msg[96];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "#OCXOCAL,%c,%ld,%lu.%06lu,%u,%lu,%u",
+    state_char,
+    (long)ocxo_rate_ppb,
+    (unsigned long)(step >> 32),
+    (unsigned long)frac_e6,
+    (unsigned)pps_cal_count,
+    (unsigned long)ocxo_cal_span_s,
+    (unsigned)ocxo_cal_pairs
+  );
+  host_send_line(msg);
+}
+
+static void pps_cal_reset()
+{
+  pps_cal_head = 0;
+  pps_cal_count = 0;
+  pps_cal_since_update = 0;
+  ocxo_cal_span_s = 0;
+  ocxo_cal_pairs = 0;
+}
+
+// Chronological access: age_index 0 is the oldest retained sample.
+static const PpsCalSample *pps_cal_at(uint16_t age_index)
+{
+  const uint16_t oldest = (uint16_t)(
+    (pps_cal_head + PPS_CAL_RING_LEN - pps_cal_count) % PPS_CAL_RING_LEN);
+  return &pps_cal_ring[(uint16_t)((oldest + age_index) % PPS_CAL_RING_LEN)];
+}
+
+static void pps_cal_push(uint32_t tick, uint32_t epoch)
+{
+  pps_cal_ring[pps_cal_head].tick = tick;
+  pps_cal_ring[pps_cal_head].epoch = epoch;
+  pps_cal_head = (uint16_t)((pps_cal_head + 1U) % PPS_CAL_RING_LEN);
+
+  if (pps_cal_count < PPS_CAL_RING_LEN) {
+    pps_cal_count++;
+  }
+}
+
+static bool pps_cal_estimate(uint64_t *out_step_q32)
+{
+  if (out_step_q32 == NULL || pps_cal_count < PPS_CAL_MIN_SAMPLES) {
+    return false;
+  }
+
+  const uint16_t half = (uint16_t)(pps_cal_count / 2U);
+  uint16_t n = 0;
+
+  for (uint16_t k = 0; k < half; k++) {
+    const PpsCalSample *a = pps_cal_at(k);
+    const PpsCalSample *b = pps_cal_at((uint16_t)(k + half));
+
+    const uint32_t d_epoch = b->epoch - a->epoch;
+    if (d_epoch == 0 || d_epoch > PPS_CAL_MAX_PAIR_EPOCHS) {
+      continue;
+    }
+
+    const uint32_t d_tick = b->tick - a->tick;
+    pps_cal_slopes[n++] = ((uint64_t)d_tick << 32) / (uint64_t)d_epoch;
+  }
+
+  if (n < PPS_CAL_MIN_SAMPLES / 2U) {
+    return false;
+  }
+
+  // Insertion sort: n <= PPS_CAL_RING_LEN/2 and this runs at most once every
+  // PPS_CAL_UPDATE_EDGES seconds.
+  for (uint16_t i = 1; i < n; i++) {
+    const uint64_t v = pps_cal_slopes[i];
+    uint16_t j = i;
+    while (j > 0 && pps_cal_slopes[j - 1] > v) {
+      pps_cal_slopes[j] = pps_cal_slopes[j - 1];
+      j--;
+    }
+    pps_cal_slopes[j] = v;
+  }
+
+  const uint64_t median = (n & 1U)
+    ? pps_cal_slopes[n / 2U]
+    : ((pps_cal_slopes[n / 2U - 1U] >> 1) + (pps_cal_slopes[n / 2U] >> 1));
+
+  const PpsCalSample *oldest = pps_cal_at(0);
+  const PpsCalSample *newest = pps_cal_at((uint16_t)(pps_cal_count - 1U));
+  ocxo_cal_span_s = newest->epoch - oldest->epoch;
+  ocxo_cal_pairs = n;
+
+  *out_step_q32 = median;
+  return true;
+}
+
+// Recompute from the ring and adopt the result if it is plausible. Returns true
+// if a new rate was applied.
+static bool ocxo_cal_try_update()
+{
+  uint64_t step_q32 = 0;
+  if (!pps_cal_estimate(&step_q32)) {
+    return false;
+  }
+
+  // A wild estimate means the capture train is wrong, not the oscillator.
+  // Keeping the previous rate is always safer than trusting it.
+  const int32_t ppb = ocxo_ppb_from_step(step_q32);
+  if (ppb > OCXO_RATE_MAX_PPB || ppb < -OCXO_RATE_MAX_PPB) {
+    return false;
+  }
+
+  ocxo_apply_rate(step_q32, OCXO_CAL_MEASURED);
+  return true;
+}
+
+static void pps_cal_on_real_pps(uint32_t t_epoch)
+{
+  const bool gnss_vouches =
+    gnss_utc.valid &&
+    gnss_utc.tAcc_ns <= PPS_CAL_MAX_TACC_NS &&
+    (uint32_t)(millis() - gnss_utc.received_ms) <= PPS_CAL_UTC_FRESH_MS;
+
+  if (!gnss_vouches) {
+    return;
+  }
+
+  pps_cal_push(t_epoch, epoch_count);
+
+  if (!ocxo_cal_auto) {
+    return;
+  }
+
+  if (++pps_cal_since_update < PPS_CAL_UPDATE_EDGES) {
+    return;
+  }
+  pps_cal_since_update = 0;
+
+  const int32_t prev_ppb = ocxo_rate_ppb;
+  const bool was_measured = (ocxo_cal_state == OCXO_CAL_MEASURED);
+
+  if (!ocxo_cal_try_update()) {
+    return;
+  }
+
+  const int32_t moved = (ocxo_rate_ppb > prev_ppb)
+    ? (ocxo_rate_ppb - prev_ppb)
+    : (prev_ppb - ocxo_rate_ppb);
+
+  if (!was_measured || moved >= OCXO_CAL_REPORT_PPB) {
+    ocxo_cal_report();
+  }
+}
+
+// Fold every edge collected so far into the rate immediately, instead of waiting
+// for the next PPS_CAL_UPDATE_EDGES boundary, and report what is in effect.
+//
+// This recomputes rather than clears. The ring's accumulated baseline is exactly
+// what gives the estimate its resolution, so discarding samples would make the
+// rate worse and leave it unavailable for the next PPS_CAL_MIN_SAMPLES edges.
+//
+// A rate pinned with $ZOCXOCAL=<ppb> is deliberately left alone, so arming the
+// holdover experiment cannot silently re-enable estimation partway through an
+// A/B baseline run.
+static void ocxo_cal_refresh_now()
+{
+  if (ocxo_cal_auto) {
+    pps_cal_since_update = 0;
+    ocxo_cal_try_update();
+  }
+
+  ocxo_cal_report();
+}
+
 extern "C" void GPT2_IRQHandler();
 
 static inline uint32_t OCXO_counter_us()
@@ -881,11 +1255,15 @@ static inline uint32_t OCXO_counter_us()
   return GPT2_CNT;
 }
 
-static inline void gpt2_set_compare_us(uint32_t t_us)
+// Place the virtual-epoch train n_ahead measured seconds after t_anchor. The
+// anchor is always a real PPS capture, so the holdover train stays phase-locked
+// to the last GNSS edge instead of accumulating the oscillator's rate error.
+static inline void gpt2_schedule_epoch_train(uint32_t t_anchor, uint32_t n_ahead)
 {
   noInterrupts();
-  gpt2_next_compare = t_us;
-  GPT2_OCR1 = t_us;
+  next_compare_q32 =
+    ((uint64_t)t_anchor << 32) + epoch_step_q32 * (uint64_t)n_ahead;
+  GPT2_OCR1 = (uint32_t)(next_compare_q32 >> 32);
   interrupts();
 }
 
@@ -955,16 +1333,17 @@ static bool utc_timestamp_for_counter(
   // If a capture belongs to the immediately previous epoch, move both the
   // counter reference and UTC label back together.
   if ((int32_t)(counter_us - ref) < 0) {
-    ref -= EPOCH_US;
+    ref -= epoch_ticks();
     second--;
   }
 
-  uint32_t elapsed_us = (uint32_t)(counter_us - ref);
+  const uint32_t elapsed_ticks = (uint32_t)(counter_us - ref);
 
   // This also handles the small window where an epoch interrupt occurred but
-  // the main loop has not processed it yet.
-  second += (int64_t)(elapsed_us / EPOCH_US);
-  const uint32_t fraction_us = elapsed_us % EPOCH_US;
+  // the main loop has not processed it yet. Whole seconds are counted in the
+  // tick domain; only the sub-second remainder becomes microseconds.
+  second += (int64_t)(elapsed_ticks / epoch_ticks());
+  const uint32_t fraction_us = ticks_to_us(elapsed_ticks % epoch_ticks());
 
   *out_epoch_second = second;
   *out_fraction_us = fraction_us;
@@ -1447,8 +1826,10 @@ extern "C" void GPT2_IRQHandler()
     cmp_pending = true;
     GPT2_SR = GPT_SR_OF1;
 
-    gpt2_next_compare += EPOCH_US;
-    GPT2_OCR1 = gpt2_next_compare;
+    // Accumulate in Q32.32 so the sub-tick part of the measured second carries
+    // across epochs instead of being truncated away each time.
+    next_compare_q32 += epoch_step_q32;
+    GPT2_OCR1 = (uint32_t)(next_compare_q32 >> 32);
   }
 
   asm volatile("dsb");
@@ -1570,7 +1951,7 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
   uint32_t elapsed = 1;
   if (pps_valid) {
     const uint32_t dt = (uint32_t)(t_epoch - current_epoch_us);
-    elapsed = (dt + EPOCH_US / 2U) / EPOCH_US;
+    elapsed = (dt + epoch_ticks() / 2U) / epoch_ticks();
   }
 
   current_epoch_us = t_epoch;
@@ -1585,6 +1966,12 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     holdover_age_s = 0;
   } else if (timing_mode == TIMING_HOLDOVER) {
     holdover_age_s += elapsed;
+  }
+
+  // Feed the rate estimator before the train is re-anchored below, so a new
+  // measurement takes effect on this edge rather than the next one.
+  if (real_pps) {
+    pps_cal_on_real_pps(t_epoch);
   }
 
   if (payload_valid_epochs != 0 &&
@@ -1611,7 +1998,7 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps)
     last_real_pps_us = t_epoch;
     timing_mode = TIMING_PPS_LOCKED;
 
-    gpt2_set_compare_us(t_epoch + EPOCH_US);
+    gpt2_schedule_epoch_train(t_epoch, 1);
     gpt2_disable_compare_irq();
   }
 
@@ -1639,7 +2026,7 @@ static uint32_t epoch_ref_for_capture(uint32_t t_capture)
   // This can happen when both PPS and receive flag are pending, and the
   // main loop processes PPS first.
   if ((int32_t)(t_capture - ref) < 0) {
-    ref -= EPOCH_US;
+    ref -= epoch_ticks();
   }
 
   return ref;
@@ -1660,7 +2047,8 @@ static void handle_rxs_event(uint32_t t_rxs)
 
   uint32_t ref_epoch_us = epoch_ref_for_capture(t_rxs);
 
-  pending_delta_us = (int32_t)((uint32_t)(t_rxs - ref_epoch_us));
+  pending_delta_us =
+    (int32_t)ticks_to_us((uint32_t)(t_rxs - ref_epoch_us));
   pending_delta_ms = millis();
   pending_delta_valid = true;
   pending_delta_holdover_age_s = holdover_age_s;
@@ -1699,7 +2087,7 @@ static void maybe_enter_holdover()
     return;
   }
 
-  uint32_t missed_epochs = since_last_pps / EPOCH_US;
+  uint32_t missed_epochs = since_last_pps / epoch_ticks();
   if (missed_epochs == 0) {
     missed_epochs = 1;
   }
@@ -1710,12 +2098,21 @@ static void maybe_enter_holdover()
   // lag by one second after entering holdover.
   timing_mode = TIMING_HOLDOVER;
 
+  // Place every virtual epoch at the measured rate from the last real edge
+  // rather than at a nominal 1e6 ticks, so the train inherits GNSS phase and
+  // does not walk off at the oscillator's frequency offset.
   for (uint32_t i = 1; i <= missed_epochs; i++) {
-    handle_epoch_event(last_real_pps_us + i * EPOCH_US, false);
+    const uint64_t pos_q32 =
+      ((uint64_t)last_real_pps_us << 32) + epoch_step_q32 * (uint64_t)i;
+    handle_epoch_event((uint32_t)(pos_q32 >> 32), false);
   }
 
-  gpt2_set_compare_us(current_epoch_us + EPOCH_US);
+  gpt2_schedule_epoch_train(last_real_pps_us, missed_epochs + 1U);
   gpt2_enable_compare_irq();
+
+  // Start a fresh calibration window on the next lock: pairs straddling the
+  // outage could span more than the counter's 4295 s wrap.
+  pps_cal_reset();
 
 #if ENABLE_USB_DEBUG
   Serial.println("TIMING: entered OCXO holdover");
@@ -2877,6 +3274,43 @@ static bool handle_experiment_command(const char *line)
     char msg[64];
     snprintf(msg, sizeof(msg), "#IGNOREPPSAFTER,%lu", requested);
     host_send_line(msg);
+
+    // Pair the experiment's state change with the rate that will be carried
+    // into holdover, so the bag records both together.
+    ocxo_cal_refresh_now();
+    return true;
+  }
+
+  if (strcmp(line, "$ZOCXOCAL?") == 0) {
+    ocxo_cal_report();
+    return true;
+  }
+
+  if (strcmp(line, "$ZOCXOCAL=AUTO") == 0) {
+    ocxo_cal_auto = true;
+    pps_cal_reset();
+    ocxo_apply_rate((uint64_t)EPOCH_TICKS_NOM << 32, OCXO_CAL_NOMINAL);
+    ocxo_cal_report();
+    return true;
+  }
+
+  static const char cal_prefix[] = "$ZOCXOCAL=";
+  if (starts_with(line, cal_prefix)) {
+    const char *value_text = line + strlen(cal_prefix);
+    char *end = NULL;
+    const long requested = strtol(value_text, &end, 10);
+    if (value_text[0] == '\0' || end == NULL || *end != '\0' ||
+        requested > OCXO_RATE_MAX_PPB || requested < -OCXO_RATE_MAX_PPB) {
+      host_send_line("#OCXOCAL,ERROR");
+      return true;
+    }
+
+    // Pinning the rate also stops auto-estimation, so =0 reproduces the
+    // original fixed-1e6 behaviour exactly for A/B holdover runs.
+    ocxo_cal_auto = false;
+    pps_cal_reset();
+    ocxo_apply_rate(ocxo_step_from_ppb((int32_t)requested), OCXO_CAL_MANUAL);
+    ocxo_cal_report();
     return true;
   }
 
