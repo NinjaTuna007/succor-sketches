@@ -138,13 +138,15 @@
 //
 // OCXO holdover experiment:
 //   $ZIGNOREPPSAFTER=0    Never ignore PPS (default; all normal sticks).
-//   $ZIGNOREPPSAFTER=N    After N seconds since boot, stop accepting real PPS
-//                         captures. last_real_pps_us then goes stale and timing
-//                         drifts into OCXO holdover (PPS_TIMEOUT_US later),
-//                         exactly as if the PPS wire had been cut. Payloads are
-//                         stamped 'H' and $ZUTC? reports HOLDOVER from then on.
-//                         Send =0 to re-arm (next real PPS re-locks).
-//   $ZIGNOREPPSAFTER?     Report the current limit (seconds, 0 = disabled).
+//                         Clears any armed deadline; next real PPS re-locks.
+//   $ZIGNOREPPSAFTER=N    After N seconds from *this command* (not Teensy boot),
+//                         stop accepting real PPS captures. last_real_pps_us
+//                         then goes stale and timing drifts into OCXO holdover
+//                         (PPS_TIMEOUT_US later), as if the PPS wire were cut.
+//                         Payloads are stamped 'H' and $ZUTC? reports HOLDOVER.
+//                         Re-send =0 then =N to restart the countdown (e.g. ROS
+//                         driver restart mid-run).
+//   $ZIGNOREPPSAFTER?     Report the configured delay (seconds, 0 = disabled).
 //
 //   $Z commands are handled even while a $Y modem config is pending, so the
 //   host may send this right after the $Y receiver/transmitter config.
@@ -914,15 +916,19 @@ static char timing_mode_code(TimingMode mode)
   }
 }
 
-// $ZIGNOREPPSAFTER experiment: after this many seconds of uptime, stop
-// accepting real PPS captures so timing drifts into OCXO holdover, as if the
-// PPS wire had been cut. 0 = never ignore (default on all normal sticks).
+// $ZIGNOREPPSAFTER experiment: after this many seconds from when N was armed,
+// stop accepting real PPS so timing drifts into OCXO holdover. 0 / disarmed =
+// never ignore (default). Deadline uses wrap-safe millis comparison.
 static uint32_t ignore_pps_after_s = 0;
+static uint32_t ignore_pps_deadline_ms = 0;
+static bool ignore_pps_armed = false;
 
 static bool pps_ignored_now()
 {
-  return ignore_pps_after_s != 0 &&
-         millis() >= (uint32_t)ignore_pps_after_s * 1000UL;
+  if (!ignore_pps_armed || ignore_pps_after_s == 0) {
+    return false;
+  }
+  return (int32_t)(millis() - ignore_pps_deadline_ms) >= 0;
 }
 
 // Build an absolute UTC timestamp from the UTC-labelled epoch and the OCXO
@@ -2858,7 +2864,16 @@ static bool handle_experiment_command(const char *line)
       return true;
     }
 
-    ignore_pps_after_s = (uint32_t)requested;
+    if (requested == 0) {
+      ignore_pps_after_s = 0;
+      ignore_pps_deadline_ms = 0;
+      ignore_pps_armed = false;
+    } else {
+      ignore_pps_after_s = (uint32_t)requested;
+      ignore_pps_deadline_ms =
+        millis() + (uint32_t)requested * 1000UL;
+      ignore_pps_armed = true;
+    }
     char msg[64];
     snprintf(msg, sizeof(msg), "#IGNOREPPSAFTER,%lu", requested);
     host_send_line(msg);
