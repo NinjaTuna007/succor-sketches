@@ -169,8 +169,15 @@
 //
 //   Calibration needs roughly a minute of PPS lock before it improves on
 //   nominal, and keeps improving until the ring fills (~8.5 min). #OCXOCAL is
-//   emitted on the first measurement and whenever the rate moves by >=5 ppb, so
-//   the applied rate is recoverable from the bag.
+//   emitted on the first measurement, whenever the rate moves by >=5 ppb, and
+//   once more at the moment holdover is entered, so the applied rate is
+//   recoverable from the bag.
+//
+//   Resolution scales with ring depth, since pairs straddle half the ring:
+//   512 samples give a 256 s baseline and a 3.9 ppb grid, but the 64-sample
+//   minimum gives only 32 s and 31 ppb. Any PPS outage clears the ring, so
+//   check <samples> in #OCXOCAL before trusting a rate. Every #OWTT row also
+//   carries the receiver's rate and state in rx_ocxo_ppb / rx_ocxo_cal.
 //
 //   $Z commands are handled even while a $Y modem config is pending, so the
 //   host may send this right after the $Y receiver/transmitter config.
@@ -1062,18 +1069,25 @@ static void ocxo_apply_rate(uint64_t step_q32, OcxoCalState state)
   ocxo_cal_state = state;
 }
 
+// N = nominal 1e6, M = measured from PPS, F = pinned by $ZOCXOCAL=<ppb>.
+static char ocxo_cal_state_char()
+{
+  if (ocxo_cal_state == OCXO_CAL_MEASURED) {
+    return 'M';
+  }
+  if (ocxo_cal_state == OCXO_CAL_MANUAL) {
+    return 'F';
+  }
+  return 'N';
+}
+
 static void ocxo_cal_report()
 {
   const uint64_t step = epoch_step_q32;
   const uint32_t frac_e6 =
     (uint32_t)(((step & 0xFFFFFFFFULL) * 1000000ULL) >> 32);
 
-  char state_char = 'N';
-  if (ocxo_cal_state == OCXO_CAL_MEASURED) {
-    state_char = 'M';
-  } else if (ocxo_cal_state == OCXO_CAL_MANUAL) {
-    state_char = 'F';
-  }
+  const char state_char = ocxo_cal_state_char();
 
   char msg[96];
   snprintf(
@@ -2110,6 +2124,13 @@ static void maybe_enter_holdover()
   gpt2_schedule_epoch_train(last_real_pps_us, missed_epochs + 1U);
   gpt2_enable_compare_irq();
 
+  // Record the rate the holdover actually inherits, and the ring depth behind
+  // it, while those counters still hold the pre-cut window. $ZIGNOREPPSAFTER
+  // reports at arm time, but the estimator keeps revising for the N seconds
+  // until the cut, so that earlier line is not necessarily what is in effect
+  // here. The reset below would otherwise zero samples/span/pairs.
+  ocxo_cal_report();
+
   // Start a fresh calibration window on the next lock: pairs straddling the
   // outage could span more than the counter's 4295 s wrap.
   pps_cal_reset();
@@ -2797,7 +2818,8 @@ static void emit_owtt_csv_header()
   host_send_line(
     "#OWTT_HEADER,seq,src,tx_us,rx_us,tof_us,delta_us,"
     "rx_mode,rx_holdover_age_s,rx_gnss_age_ms,tx_mode,"
-    "tx_holdover_age_s,decode_delay_ms,lat,lon"
+    "tx_holdover_age_s,decode_delay_ms,lat,lon,"
+    "rx_ocxo_ppb,rx_ocxo_cal"
   );
 }
 
@@ -2969,11 +2991,11 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     (int64_t)payload_info.tx_ss * 1000000LL +
     (int64_t)payload_info.tx_fraction_us;
 
-  char row[320];
+  char row[352];
   snprintf(
     row,
     sizeof(row),
-    "#OWTT,%u,%s,%lld,%lld,%lld,%ld,%c,%lu,%lu,%c,%lu,%lu,%s,%s",
+    "#OWTT,%u,%s,%lld,%lld,%lld,%ld,%c,%lu,%lu,%c,%lu,%lu,%s,%s,%ld,%c",
     (unsigned int)payload_info.sequence,
     payload_info.source_id,
     (long long)tx_ss_time_us,
@@ -2987,7 +3009,9 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     (unsigned long)payload_info.tx_holdover_age_s,
     (unsigned long)decode_delay_ms,
     lat,
-    lon
+    lon,
+    (long)ocxo_rate_ppb,
+    ocxo_cal_state_char()
   );
   host_send_line(row);
 }
