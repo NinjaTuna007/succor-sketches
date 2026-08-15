@@ -114,6 +114,7 @@
 //        #I<tof_us>
 //   4. Full CSV context row for bags / post-analysis:
 //        #OWTT,<seq>,<src>,<tx_us>,<rx_us>,<tof_us>,<delta_us>,...
+//   Independently, one #TEMPMON line every few seconds from loop() (see below).
 //   If UTC is missing or TOF is implausible, emit #INA / #E,I,... instead of
 //   #I/#OWTT (see emit path after extract_timed_payload_from_modem_line).
 //
@@ -137,6 +138,7 @@
 //   $ZPAYLOADTTL=N    Expire it after N PPS/holdover epochs.
 //   $ZTXWARN=1/0      Enable/disable one-shot TX warnings (default off).
 //   $ZOWTTHEADER?     Reprint the #OWTT CSV column header.
+//   $ZTEMP?           Latest on-die TEMPMON reading as #TEMPMON.
 //
 // OCXO holdover experiment:
 //   $ZIGNOREPPSAFTER=0    Never ignore PPS (default; all normal sticks).
@@ -177,7 +179,21 @@
 //   512 samples give a 256 s baseline and a 0.39 ppb grid, but the 64-sample
 //   minimum gives only 32 s and 3.1 ppb. Any PPS outage clears the ring, so
 //   check <samples> in #OCXOCAL before trusting a rate. Every #OWTT row also
-//   carries the receiver's rate and state in rx_ocxo_ppb / rx_ocxo_cal.
+//   carries the receiver's rate and state in rx_ocxo_ppb / rx_ocxo_cal, and
+//   the on-die TEMPMON reading in rx_die_c.
+//
+// On-die temperature (i.MX RT1062 TEMPMON):
+//   The Teensy 4.1 silicon has a factory-calibrated junction sensor, already
+//   started by the core. It is the MCU die, not the OCXO crystal: useful for
+//   tagging a holdover residual with enclosure / diurnal temperature, not for
+//   subtracting a tempco. Polled from loop() every few seconds, never from
+//   the PPS/epoch path: tempmonGetTemp() busy-waits on VALID (usually already
+//   set; ~90 us worst case), and a USB emit can stall much longer than that.
+//   A TeensyThreads worker is the wrong tool here — the e-ink thread exists
+//   because display() blocks for ~13 s. Emitted as
+//     #TEMPMON,<epoch>,<P|H>,<die_c>
+//   so a 36-hour bag still has a temperature axis through acoustic dropouts.
+//   $ZTEMP? reprints the latest reading.
 //
 //   $Z commands are handled even while a $Y modem config is pending, so the
 //   host may send this right after the $Y receiver/transmitter config.
@@ -1097,6 +1113,73 @@ static char ocxo_cal_state_char()
     return 'F';
   }
   return 'N';
+}
+
+// MCU junction temperature from the i.MX RT1062 TEMPMON, in centi-degC.
+// Written only from loop() / $ZTEMP?, never from handle_epoch_event.
+static int32_t die_c_x100 = 0;
+static bool die_c_valid = false;
+static uint32_t die_c_last_ms = 0;
+static constexpr uint32_t DIE_TEMP_PERIOD_MS = 5000UL;
+
+static void format_die_c(char *buf, size_t n)
+{
+  if (!die_c_valid || buf == NULL || n < 16) {
+    if (buf != NULL && n > 0) {
+      buf[0] = '\0';
+    }
+    return;
+  }
+  const char sign = (die_c_x100 < 0) ? '-' : '+';
+  const uint32_t a = (uint32_t)((die_c_x100 < 0) ? -die_c_x100 : die_c_x100);
+  snprintf(buf, n, "%c%lu.%02lu", sign, (unsigned long)(a / 100U),
+           (unsigned long)(a % 100U));
+}
+
+static void emit_tempmon_line()
+{
+  char die[16];
+  format_die_c(die, sizeof(die));
+  if (die[0] == '\0') {
+    return;
+  }
+  char msg[48];
+  snprintf(
+    msg,
+    sizeof(msg),
+    "#TEMPMON,%lu,%c,%s",
+    (unsigned long)epoch_count,
+    timing_mode_code(timing_mode),
+    die
+  );
+  host_send_line(msg);
+}
+
+static bool sample_die_temp()
+{
+  // Do not call tempmonGetTemp() unless VALID is already set: that helper
+  // busy-waits, and a conversion in flight is ~90 us at the core's 3/32768 s
+  // measure period. Skip this pass rather than stall the ranging loop.
+  if (!(TEMPMON_TEMPSENSE0 & 0x4U)) {
+    return false;
+  }
+  const float t = tempmonGetTemp();
+  die_c_x100 = (int32_t)(t * 100.0f + (t >= 0.0f ? 0.5f : -0.5f));
+  die_c_valid = true;
+  return true;
+}
+
+static void service_die_temp()
+{
+  const uint32_t now = millis();
+  if (die_c_valid && (uint32_t)(now - die_c_last_ms) < DIE_TEMP_PERIOD_MS) {
+    return;
+  }
+  if (!sample_die_temp()) {
+    return;
+  }
+  die_c_last_ms = now;
+  emit_tempmon_line();
 }
 
 static void ocxo_cal_report()
@@ -2844,7 +2927,7 @@ static void emit_owtt_csv_header()
     "#OWTT_HEADER,seq,src,tx_us,rx_us,tof_us,delta_us,"
     "rx_mode,rx_holdover_age_s,rx_gnss_age_ms,tx_mode,"
     "tx_holdover_age_s,decode_delay_ms,lat,lon,"
-    "rx_ocxo_ppb,rx_ocxo_cal"
+    "rx_ocxo_ppb,rx_ocxo_cal,rx_die_c"
   );
 }
 
@@ -3016,11 +3099,14 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     (int64_t)payload_info.tx_ss * 1000000LL +
     (int64_t)payload_info.tx_fraction_us;
 
+  char die[16];
+  format_die_c(die, sizeof(die));
+
   char row[352];
   snprintf(
     row,
     sizeof(row),
-    "#OWTT,%u,%s,%lld,%lld,%lld,%ld,%c,%lu,%lu,%c,%lu,%lu,%s,%s,%ld,%c",
+    "#OWTT,%u,%s,%lld,%lld,%lld,%ld,%c,%lu,%lu,%c,%lu,%lu,%s,%s,%ld,%c,%s",
     (unsigned int)payload_info.sequence,
     payload_info.source_id,
     (long long)tx_ss_time_us,
@@ -3036,7 +3122,8 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
     lat,
     lon,
     (long)ocxo_rate_ppb,
-    ocxo_cal_state_char()
+    ocxo_cal_state_char(),
+    die
   );
   host_send_line(row);
 }
@@ -3360,6 +3447,18 @@ static bool handle_experiment_command(const char *line)
     pps_cal_reset();
     ocxo_apply_rate(ocxo_step_from_ppb((int32_t)requested), OCXO_CAL_MANUAL);
     ocxo_cal_report();
+    return true;
+  }
+
+  if (strcmp(line, "$ZTEMP?") == 0) {
+    if (!die_c_valid) {
+      sample_die_temp();
+    }
+    if (die_c_valid) {
+      emit_tempmon_line();
+    } else {
+      host_send_line("#TEMPMON,NA");
+    }
     return true;
   }
 
@@ -3869,4 +3968,7 @@ void loop()
   // E-ink status: coalesce full refreshes (see EPD_MIN_REFRESH_MS).
   sync_owtt_epd_status();
   owtt_epd_service();
+
+  // Die temperature: idle-path only, after timing and serial have run.
+  service_die_temp();
 }
