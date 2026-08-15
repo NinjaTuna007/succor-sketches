@@ -98,7 +98,7 @@
 //   - External 10 MHz OCXO clock into pin 14.
 //   - PPS into pin 40 for synchronization of vehicles.
 //   - RxS flag into pin 15 for acoustic packet/header detection.
-//   - GPT2 runs at a nominal 1 MHz, so 1 tick is ~1 us. The true tick rate is
+//   - GPT2 counts the raw 10 MHz OCXO (1 tick = 0.1 us). The true tick rate is
 //     measured against PPS (see OCXO RATE CALIBRATION) because the oscillator's
 //     calibration tolerance alone is enough to dominate holdover error.
 //   - If PPS disappears, GPT2 compare keeps virtual 1-second epochs
@@ -144,7 +144,7 @@
 //   $ZIGNOREPPSAFTER=N    After N seconds from *this command* (not Teensy boot),
 //                         stop accepting real PPS captures. last_real_pps_us
 //                         then goes stale and timing drifts into OCXO holdover
-//                         (PPS_TIMEOUT_US later), as if the PPS wire were cut.
+//                         (PPS_TIMEOUT_TICKS later), as if the PPS wire were cut.
 //                         Payloads are stamped 'H' and $ZUTC? reports HOLDOVER.
 //                         Re-send =0 then =N to restart the countdown (e.g. ROS
 //                         driver restart mid-run).
@@ -163,7 +163,7 @@
 //   $ZOCXOCAL=AUTO    Resume estimating from PPS (default). Clears the ring and
 //                     falls back to nominal until enough edges accumulate.
 //   $ZOCXOCAL=<ppb>   Pin the rate to a known offset and stop estimating, e.g.
-//                     from a previous dive. $ZOCXOCAL=0 pins nominal 1e6 ticks
+//                     from a previous dive. $ZOCXOCAL=0 pins nominal 1e7 ticks
 //                     per second, reproducing the pre-calibration behaviour for
 //                     A/B holdover comparisons.
 //
@@ -174,8 +174,8 @@
 //   recoverable from the bag.
 //
 //   Resolution scales with ring depth, since pairs straddle half the ring:
-//   512 samples give a 256 s baseline and a 3.9 ppb grid, but the 64-sample
-//   minimum gives only 32 s and 31 ppb. Any PPS outage clears the ring, so
+//   512 samples give a 256 s baseline and a 0.39 ppb grid, but the 64-sample
+//   minimum gives only 32 s and 3.1 ppb. Any PPS outage clears the ring, so
 //   check <samples> in #OCXOCAL before trusting a rate. Every #OWTT row also
 //   carries the receiver's rate and state in rx_ocxo_ppb / rx_ocxo_cal.
 //
@@ -282,8 +282,8 @@ static constexpr uint8_t PIN_OCXO = 14;
 static constexpr uint8_t PIN_RXS_CAPTURE   = 15;
 static constexpr uint8_t PIN_PPS_CAPTURE   = 40;
 
-// External 10 MHz clock / (9 + 1) = 1 MHz GPT2 tick.
-static constexpr uint32_t GPT2_PRESCALER_VALUE = 9;
+// External 10 MHz clock / (0 + 1) = 10 MHz GPT2 tick (one raw OCXO cycle).
+static constexpr uint32_t GPT2_PRESCALER_VALUE = 0;
 
 static constexpr size_t LINE_MAX = 256;
 static constexpr size_t GPS_MAX  = 64;
@@ -321,27 +321,41 @@ static constexpr size_t GNSS_NMEA_MAX = 160;
 // OCXO ticks in a second, which is measured at runtime; see epoch_ticks() and
 // the OCXO RATE CALIBRATION section.
 static constexpr uint32_t EPOCH_US       = 1000000UL;
-static constexpr uint32_t PPS_TIMEOUT_US = 1200000UL;
 
 // Nominal OCXO ticks in one true second: 10 MHz / (GPT2_PRESCALER_VALUE + 1).
 // Only the starting point; the measured rate replaces it once PPS is available.
-static constexpr uint32_t EPOCH_TICKS_NOM = 1000000UL;
+static constexpr uint32_t EPOCH_TICKS_NOM =
+  10000000UL / (GPT2_PRESCALER_VALUE + 1U);
+// 1e9 / n0, exact at 10 MHz (100). Used to convert Q32.32 step <-> ppb.
+static constexpr int64_t OCXO_PPB_Q32_SCALE =
+  1000000000LL / (int64_t)EPOCH_TICKS_NOM;
+
+// Holdover entry: 1.2 true seconds without an accepted PPS, in GPT2 ticks
+// (not microseconds — at 10 MHz those are no longer the same).
+static constexpr uint32_t PPS_TIMEOUT_TICKS =
+  EPOCH_TICKS_NOM + EPOCH_TICKS_NOM / 5U;
 
 // PPS rate-calibration ring.
 //
 // A rate estimate resolves one counter tick divided by the pair baseline, so a
-// 1 us tick over a 256 s baseline is 3.9 ppb, while counting ticks between
-// *adjacent* edges would only resolve 1 ppm. MIN_SAMPLES already gives a usable
-// ~31 ppb estimate about a minute after lock, improving as the ring fills.
+// 0.1 us tick over a 256 s baseline is 0.39 ppb, while counting ticks between
+// *adjacent* edges would only resolve 100 ppb. MIN_SAMPLES already gives a
+// usable ~3.1 ppb estimate about a minute after lock, improving as the ring
+// fills. Pairing uses current occupancy, so a dive before the ring is full
+// still keeps whatever N >= MIN_SAMPLES is in the ring.
 static constexpr uint16_t PPS_CAL_RING_LEN     = 512;
 static constexpr uint16_t PPS_CAL_MIN_SAMPLES  = 64;
 // Re-estimate every N real edges rather than every edge; the sort is O(n^2).
 static constexpr uint16_t PPS_CAL_UPDATE_EDGES = 8;
-// Discard pairs spanning longer than this: 2^32 ticks is ~4295 s, past which a
-// tick difference is ambiguous. A full ring only spans PPS_CAL_RING_LEN
-// seconds, so this is unreachable unless the ring straddles an outage, and it
-// leaves 2x headroom on the 64-bit slope numerator.
-static constexpr uint32_t PPS_CAL_MAX_PAIR_EPOCHS = 2048UL;
+// Discard pairs spanning longer than this. GPT2 is 32-bit and wraps every
+// ~429.5 s at 10 MHz; (b.t - a.t) is an unsigned modular subtract, so a pair
+// longer than one wrap is ambiguous. A no-gap full ring pairs at 256 s; 400 s
+// leaves room for a few missed edges and keeps d_tick * 2^32 inside uint64.
+static constexpr uint32_t PPS_CAL_MAX_PAIR_EPOCHS = 400UL;
+static_assert(
+  (uint64_t)PPS_CAL_MAX_PAIR_EPOCHS * (uint64_t)EPOCH_TICKS_NOM <
+    (1ULL << 32),
+  "pair tick delta must fit in uint32");
 // Reject estimates further than this from nominal. The AOC2012 allows +-500 ppb
 // of calibration tolerance plus +-700 ppb of Vc pullability, so anything beyond
 // 2 ppm is a bad capture train rather than a real oscillator.
@@ -913,8 +927,8 @@ static volatile uint32_t cmp_stamp = 0;
 //
 // Tick position of the next virtual epoch, Q32.32. The fractional part is what
 // lets the holdover train run at the measured rate: a true second is around
-// 1000000.05 ticks, so re-truncating to whole ticks every epoch would put a
-// 1 ppm rounding error back in and undo the calibration.
+// 10000000.47 ticks, so re-truncating to whole ticks every epoch would put a
+// 100 ppb rounding error back in and undo the calibration.
 //
 // The integer part occupies bits 32..63, so uint64 wraparound is exactly the
 // mod-2^32 arithmetic the free-running counter needs.
@@ -971,10 +985,10 @@ static char pending_delta_timing_mode = 'W';
 //
 // Baseline: each pair spans half the ring, i.e. hundreds of seconds, and a
 // slope resolves one tick divided by its baseline. Slopes between *adjacent*
-// edges would resolve only 1 ppm, and since a true second is ~1000000.05 ticks,
-// nearly every adjacent count reads exactly 1000000 with a rare 1000001. Their
-// median is 1000000 exactly, discarding the entire signal, so short baselines
-// are not merely coarse but blind.
+// edges would resolve only 100 ppb, and a -47 ppb offset is still 0.47 ticks
+// per second, so a 1 s median stays half-blind. The 32 s short-lock pairs
+// already see ~15 ticks of that signal; that is why the finer tick is worth
+// it. Pairing still uses current occupancy (half of N), not a full ring.
 //
 // Robustness: the median (rather than a least-squares fit) keeps one glitched
 // capture, a spurious edge, or a PPS outage from moving the rate at all.
@@ -1028,23 +1042,26 @@ static inline uint32_t epoch_ticks()
   return epoch_ticks_int;
 }
 
-// Convert a counter interval to true microseconds. Ticks are only nominally
-// microseconds; at the measured rate a 1 s interval is off by ocxo_rate_ppb ns.
+// Convert a counter interval to true microseconds. 10 MHz ticks are 0.1 us;
+// at the measured rate a 1 s interval is off by ocxo_rate_ppb ns.
 static inline uint32_t ticks_to_us(uint32_t ticks)
 {
+  const int64_t nom_us =
+    ((int64_t)ticks * (int64_t)EPOCH_US) / (int64_t)EPOCH_TICKS_NOM;
   const int64_t corr =
-    ((int64_t)ticks * (int64_t)ocxo_rate_ppb) / 1000000000LL;
-  return (uint32_t)((int64_t)ticks - corr);
+    (nom_us * (int64_t)ocxo_rate_ppb) / 1000000000LL;
+  return (uint32_t)(nom_us - corr);
 }
 
-// ppb = (step - nominal) / nominal * 1e9. The second factor is exactly 1000
-// because the prescaled tick is one nominal microsecond. Rounded rather than
-// truncated so that a rate pinned by $ZOCXOCAL=<ppb> reads back unchanged.
+// ppb = (step - nominal) / nominal * 1e9
+//     = diff_q32 * OCXO_PPB_Q32_SCALE / 2^32.
+// Rounded rather than truncated so that a rate pinned by $ZOCXOCAL=<ppb>
+// reads back unchanged.
 static int32_t ocxo_ppb_from_step(uint64_t step_q32)
 {
   const int64_t diff_q32 =
     (int64_t)step_q32 - ((int64_t)EPOCH_TICKS_NOM << 32);
-  const int64_t scaled = diff_q32 * 1000LL;
+  const int64_t scaled = diff_q32 * OCXO_PPB_Q32_SCALE;
   const int64_t half = (int64_t)1 << 31;
   return (int32_t)(((scaled >= 0) ? (scaled + half) : (scaled - half)) /
                    ((int64_t)1 << 32));
@@ -1052,7 +1069,8 @@ static int32_t ocxo_ppb_from_step(uint64_t step_q32)
 
 static uint64_t ocxo_step_from_ppb(int32_t ppb)
 {
-  const int64_t diff_q32 = ((int64_t)ppb * ((int64_t)1 << 32)) / 1000LL;
+  const int64_t diff_q32 =
+    ((int64_t)ppb * ((int64_t)1 << 32)) / OCXO_PPB_Q32_SCALE;
   return (uint64_t)(((int64_t)EPOCH_TICKS_NOM << 32) + diff_q32);
 }
 
@@ -1069,7 +1087,7 @@ static void ocxo_apply_rate(uint64_t step_q32, OcxoCalState state)
   ocxo_cal_state = state;
 }
 
-// N = nominal 1e6, M = measured from PPS, F = pinned by $ZOCXOCAL=<ppb>.
+// N = nominal 1e7, M = measured from PPS, F = pinned by $ZOCXOCAL=<ppb>.
 static char ocxo_cal_state_char()
 {
   if (ocxo_cal_state == OCXO_CAL_MEASURED) {
@@ -1491,11 +1509,18 @@ static void maybe_bind_gnss_utc_to_current_epoch()
     return;
   }
 
-  const int64_t after_pps_us =
-    (int64_t)(int32_t)(gnss_utc.received_counter_us - current_epoch_us);
+  const int32_t after_pps_ticks =
+    (int32_t)(gnss_utc.received_counter_us - current_epoch_us);
 
-  if (after_pps_us < 0 ||
-      after_pps_us > (int64_t)UTC_BIND_MAX_AFTER_PPS_US) {
+  if (after_pps_ticks < 0) {
+    return;
+  }
+
+  // GPT2 counts 10 MHz ticks; the bind math and the 2.5 s sanity cap are
+  // in microseconds.
+  const int64_t after_pps_us = (int64_t)ticks_to_us((uint32_t)after_pps_ticks);
+
+  if (after_pps_us > (int64_t)UTC_BIND_MAX_AFTER_PPS_US) {
     return;
   }
 
@@ -1768,7 +1793,7 @@ static void gnss_nmea_feed(uint8_t b)
   }
 }
 
-static void gpt2_extclk_capture_init_1mhz()
+static void gpt2_extclk_capture_init()
 {
   CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON) |
                CCM_CCGR0_GPT2_SERIAL(CCM_CCGR_ON);
@@ -2097,7 +2122,7 @@ static void maybe_enter_holdover()
   uint32_t now = OCXO_counter_us();
   uint32_t since_last_pps = (uint32_t)(now - last_real_pps_us);
 
-  if (since_last_pps <= PPS_TIMEOUT_US) {
+  if (since_last_pps <= PPS_TIMEOUT_TICKS) {
     return;
   }
 
@@ -2113,7 +2138,7 @@ static void maybe_enter_holdover()
   timing_mode = TIMING_HOLDOVER;
 
   // Place every virtual epoch at the measured rate from the last real edge
-  // rather than at a nominal 1e6 ticks, so the train inherits GNSS phase and
+  // rather than at a nominal 1e7 ticks, so the train inherits GNSS phase and
   // does not walk off at the oscillator's frequency offset.
   for (uint32_t i = 1; i <= missed_epochs; i++) {
     const uint64_t pos_q32 =
@@ -2132,7 +2157,7 @@ static void maybe_enter_holdover()
   ocxo_cal_report();
 
   // Start a fresh calibration window on the next lock: pairs straddling the
-  // outage could span more than the counter's 4295 s wrap.
+  // outage could span more than the counter's 429.5 s wrap.
   pps_cal_reset();
 
 #if ENABLE_USB_DEBUG
@@ -3330,7 +3355,7 @@ static bool handle_experiment_command(const char *line)
     }
 
     // Pinning the rate also stops auto-estimation, so =0 reproduces the
-    // original fixed-1e6 behaviour exactly for A/B holdover runs.
+    // original fixed-nominal behaviour exactly for A/B holdover runs.
     ocxo_cal_auto = false;
     pps_cal_reset();
     ocxo_apply_rate(ocxo_step_from_ppb((int32_t)requested), OCXO_CAL_MANUAL);
@@ -3795,7 +3820,7 @@ void setup()
   // Pin 13 is SPI SCK for the e-ink panel (shared with LED_BUILTIN).
   // Do not drive it as a GPIO LED.
 
-  gpt2_extclk_capture_init_1mhz();
+  gpt2_extclk_capture_init();
 
   // Give the X20P time to boot before enabling UBX-NAV-TIMEUTC.
   gnss_timeutc_config_due_ms = millis() + 1000UL;
