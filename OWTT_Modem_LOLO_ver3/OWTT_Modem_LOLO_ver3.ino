@@ -160,14 +160,13 @@
 
 // USB host protocol must stay clean. Do not print asynchronous debug text to
 // Serial or SerialUSB1.
-#define ENABLE_USB_DEBUG 0
+#define ENABLE_USB_DEBUG 1
 #define USB_MIRROR_HOST_OUTPUT 0
 
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
 
-// Use the actual UART1 baud currently stored in the X20P. Your tested module
-// was using 115200. A factory-default X20P normally uses 38400.
+// Use the actual UART1 baud currently stored in the X20P
 static constexpr uint32_t GNSS_INITIAL_BAUD = 38400;
 
 // Normal-operation default: keep Serial2 fixed at GNSS_INITIAL_BAUD.
@@ -1239,6 +1238,7 @@ static void gpt2_extclk_capture_init_1mhz()
 
   GPT2_CR |= GPT_CR_EN;
 }
+
 
 extern "C" void GPT2_IRQHandler()
 {
