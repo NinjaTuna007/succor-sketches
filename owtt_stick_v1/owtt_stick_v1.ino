@@ -232,17 +232,32 @@
 // ===================== USER CONFIG =====================
 // =======================================================
 
-// The first USB CDC interface remains the LoLo/Succorfish protocol port.
-// The second USB CDC interface is dedicated to the X20P UART bridge.
-#define MODEM_SERIAL    Serial1
-#define HOST_SERIAL     Serial
-#define GNSS_SERIAL     Serial2
-#define GNSS_USB_SERIAL SerialUSB1
 
 // USB host protocol must stay clean. Do not print asynchronous debug text to
 // Serial or SerialUSB1.
 #define ENABLE_USB_DEBUG 0
 #define USB_MIRROR_HOST_OUTPUT 0
+#define HOST_OVER_USB 0
+
+
+// The first USB CDC interface remains the LoLo/Succorfish protocol port.
+// The second USB CDC interface is dedicated to the X20P UART bridge.
+#define MODEM_SERIAL    Serial1
+#define GNSS_SERIAL     Serial2
+#define GNSS_USB_SERIAL SerialUSB1
+
+// TODO setup this
+
+#ifdef HOST_OVER_USB
+// e.g in the case of Sticks/Floatsam/PowerPuffin(?)
+#define HOST_SERIAL     Serial
+
+#else
+// e.g in the case where LoLo is the host
+#define HOST_SERIAL Serial4
+
+#endif
+
 
 static constexpr uint32_t MODEM_BAUD = 9600;
 static constexpr uint32_t HOST_BAUD  = 115200;
