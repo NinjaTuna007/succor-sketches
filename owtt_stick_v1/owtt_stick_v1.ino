@@ -3,7 +3,9 @@
 // Teensy 4.1 bridge between Host (LoLo or Frigates) and Succorfish modem.
 //
 // ver2 adds a telemetry frame on top of ver1's GPS broadcast:
-//   - Host command "$K<payload>" stores opaque telemetry.
+//   - Host command "$K<nn><payload>" stores opaque telemetry (length-prefixed
+//     so the payload may contain CR/LF/NUL). ASCII "$K<payload>\\r\\n" still
+//     works when the two bytes after "$K" are not digits.
 //   - It is broadcast as "$BnnTEL:<payload>" on the PPS schedule.
 //   - Receivers treat any broadcast whose payload starts with "TEL:" as a
 //     telemetry frame and still emit an "#I<delta_us>" timing line for it, so
@@ -67,15 +69,15 @@
 //      Not forwarded directly to modem.
 //
 // Telemetry update command, transmitter mode only:
-//   $K<payload>
-//      Updates internal latest telemetry variable only.
+//   $K<nn><payload>
+//      Updates internal latest telemetry variable only. nn is the two-digit
+//      byte length of <payload> (same rule as $B). The payload may contain
+//      any byte (DCCL, CRC-8, CR/LF). Not forwarded to the modem.
 //      "$K" is used (not "$T") because "$T" is an existing Succorfish modem
-//      command; the host->Teensy command prefix must not collide with it.
-//      <payload> is opaque, host-encoded data (e.g. position + speed +
-//      bt_tip status). The Teensy does not interpret it.
-//      Not forwarded directly to modem.
-//      Stored/broadcast with a leading "TEL:" telemetry marker, i.e.
-//      "$K<payload>" goes out as "$BnnTEL:<payload>".
+//      command. Stored/broadcast with a leading "TEL:" marker, i.e.
+//      "$K<nn><payload>" goes out as "$BmmTEL:<payload>".
+//      ASCII "$K<payload>\\r\\n" is still accepted when the two bytes after
+//      "$K" are not digits.
 //      When telemetry is valid it takes precedence over GPS for the
 //      scheduled broadcast (see below).
 //
@@ -669,7 +671,7 @@ static int fa_host_tx_header(
   if (len < 2) {
     return 0;
   }
-  if (buf[1] == 'B') {
+  if (buf[1] == 'B' || buf[1] == 'K') {
     if (len < 4) {
       return 0;
     }
@@ -786,7 +788,7 @@ static bool fa_pop_newline(
   return ok;
 }
 
-// Host TX: $B/$U/$M/$E are complete after the length-prefixed payload.
+// Host TX: $B/$K/$U/$M/$E are complete after the length-prefixed payload.
 // A following CRLF (string-topic writes) is left in the buffer as an empty skip.
 static bool fa_pop_host(
   FrameAssembler &a, uint8_t *out, size_t out_sz, size_t *out_len)
@@ -2822,9 +2824,10 @@ static void maybe_emit_tx_warning(TxWarningReason reason)
 // The receiver reconstructs the full absolute time with its own UTC clock
 // (see resolve_tx_time_us). holdover is emitted only when non-zero (i.e. the
 // transmitter is free-running); a locked transmitter omits the field.
-static bool send_timestamped_broadcast(const char *application_payload)
+static bool send_timestamped_broadcast(
+  const uint8_t *application_payload, size_t app_len)
 {
-  if (application_payload == NULL || application_payload[0] == '\0') {
+  if (application_payload == NULL || app_len < 1) {
     return false;
   }
 
@@ -2870,7 +2873,6 @@ static bool send_timestamped_broadcast(const char *application_payload)
     );
   }
 
-  const size_t app_len = strlen(application_payload);
   if (header_len < 1 ||
       app_len < 1 ||
       (size_t)header_len + app_len > MODEM_PAYLOAD_MAX) {
@@ -2905,7 +2907,8 @@ static bool send_latest_gps_broadcast()
     return false;
   }
 
-  return send_timestamped_broadcast(latest_gps);
+  return send_timestamped_broadcast(
+    (const uint8_t *)latest_gps, latest_gps_len);
 }
 
 static bool update_latest_telemetry_from_host(const char *line)
@@ -2949,6 +2952,26 @@ static bool update_latest_telemetry_from_host(const char *line)
   return true;
 }
 
+static bool update_latest_telemetry_from_bytes(const uint8_t *user, size_t un)
+{
+  if (cfg.mode != MODE_TRANSMITTER) {
+    return false;
+  }
+  if (user == NULL || un < 1 || (un + TELEMETRY_MARKER_LEN) > GPS_MAX) {
+    return true;
+  }
+
+  memcpy(latest_telem, TELEMETRY_MARKER, TELEMETRY_MARKER_LEN);
+  memcpy(latest_telem + TELEMETRY_MARKER_LEN, user, un);
+  latest_telem[TELEMETRY_MARKER_LEN + un] = 0;
+  latest_telem_len = TELEMETRY_MARKER_LEN + un;
+
+  latest_telem_epoch_count = epoch_count;
+  latest_telem_valid = true;
+  tx_last_warning = TX_WARN_NONE;
+  return true;
+}
+
 static bool send_latest_telemetry_broadcast()
 {
   if (cfg.mode != MODE_TRANSMITTER ||
@@ -2957,7 +2980,8 @@ static bool send_latest_telemetry_broadcast()
     return false;
   }
 
-  return send_timestamped_broadcast(latest_telem);
+  return send_timestamped_broadcast(
+    (const uint8_t *)latest_telem, latest_telem_len);
 }
 
 // =======================================================
@@ -3823,6 +3847,11 @@ static void handle_host_frame(const uint8_t *frame, size_t n)
       payload_start + nbytes == n) {
     if (pending_cfg.active) {
       host_send_line("#E,Y,BUSY");
+      return;
+    }
+    // $K is host-only (store telemetry). Do not write "$K..." to the modem.
+    if (n >= 2 && frame[0] == '$' && frame[1] == 'K') {
+      update_latest_telemetry_from_bytes(frame + payload_start, nbytes);
       return;
     }
     modem_send_bytes(frame, n);
