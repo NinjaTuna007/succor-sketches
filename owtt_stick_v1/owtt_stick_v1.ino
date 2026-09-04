@@ -104,10 +104,11 @@
 //   - If PPS disappears, GPT2 compare keeps virtual 1-second epochs
 //     using the OCXO holdover clock, advanced at the measured rate.
 //
-// Receiver output order (after a timed GPS/TEL modem line, when UTC is valid):
-//   1. Forward raw modem line to host, e.g.
+// Receiver output order (after a timed modem line, when UTC is valid):
+//   1. Forward the raw modem frame to the host as bytes + CRLF, e.g.
 //      #Bxxxnndd...
 //      #B00722<lat>,<lon>
+//      (payload may contain CR/LF; the host ROS driver length-prefixes #B/#U)
 //   2. Optional UTC-labelled capture residual (EMIT_RX_UTC_LINE):
 //        #J<rx_utc_unix_s>,<delta_us>
 //   3. Absolute one-way travel time (TX stamp -> RX capture), for ROS ranging:
@@ -116,7 +117,7 @@
 //        #OWTT,<seq>,<src>,<tx_us>,<rx_us>,<tof_us>,<delta_us>,...
 //   Independently, one #TEMPMON line every few seconds from loop() (see below).
 //   If UTC is missing or TOF is implausible, emit #INA / #E,I,... instead of
-//   #I/#OWTT (see emit path after extract_timed_payload_from_modem_line).
+//   #I/#OWTT (see emit path after extract_timed_payload_from_modem_frame).
 //
 // GNSS diagnostics from the first USB/host port:
 //   $ZGNSS?
@@ -625,94 +626,315 @@ struct GnssNmeaObserver {
 static GnssNmeaObserver gnss_nmea = {false, 0, {0}};
 
 // =======================================================
-// ===================== LINE READER =====================
+// ===================== FRAME ASSEMBLER =================
 // =======================================================
+//
+// Text records are newline-delimited. NM3 *data* is length-prefixed and the
+// payload may contain CR/LF/NUL:
+//   Host → modem: $B<xx><data>, $U/$M/$E<xxx><yy><data>  (no trailer required)
+//   Modem → host: #B<aaa><yy><data>[Q…][D…][T…]<CRLF>
+//                 #U<yy><data>[trailer]<CRLF>
 
-struct LineReader {
-  char buf[LINE_MAX];
+struct FrameAssembler {
+  uint8_t buf[LINE_MAX];
   size_t len;
-  bool saw_cr;
 };
 
-static LineReader host_reader  = {{0}, 0, false};
-static LineReader modem_reader = {{0}, 0, false};
+static FrameAssembler host_fa  = {{0}, 0};
+static FrameAssembler modem_fa = {{0}, 0};
 
-static bool read_line(Stream &s, LineReader &r, char *out, size_t out_sz)
+static bool fa_is_digit(uint8_t b)
 {
-  while (s.available() > 0) {
-    int b = s.read();
-    if (b < 0) {
-      return false;
+  return b >= '0' && b <= '9';
+}
+
+static int fa_digits2(const uint8_t *buf, size_t offset, size_t len)
+{
+  if (offset + 2 > len) {
+    return -1;
+  }
+  if (!fa_is_digit(buf[offset]) || !fa_is_digit(buf[offset + 1])) {
+    return -2;
+  }
+  return (int)(buf[offset] - '0') * 10 + (int)(buf[offset + 1] - '0');
+}
+
+// 1 = header ready, 0 = need more bytes, -1 = not a length-prefixed record.
+static int fa_host_tx_header(
+  const uint8_t *buf, size_t len, size_t *payload_start, size_t *nbytes)
+{
+  if (len == 0 || buf[0] != '$') {
+    return -1;
+  }
+  if (len < 2) {
+    return 0;
+  }
+  if (buf[1] == 'B') {
+    if (len < 4) {
+      return 0;
     }
+    const int n = fa_digits2(buf, 2, len);
+    if (n < 0) {
+      return -1;
+    }
+    *payload_start = 4;
+    *nbytes = (size_t)n;
+    return 1;
+  }
+  if (buf[1] == 'U' || buf[1] == 'M' || buf[1] == 'E') {
+    if (len < 7) {
+      return 0;
+    }
+    if (!fa_is_digit(buf[2]) || !fa_is_digit(buf[3]) || !fa_is_digit(buf[4])) {
+      return -1;
+    }
+    const int n = fa_digits2(buf, 5, len);
+    if (n < 0) {
+      return -1;
+    }
+    *payload_start = 7;
+    *nbytes = (size_t)n;
+    return 1;
+  }
+  return -1;
+}
 
-    char c = (char)b;
-
-    if (r.saw_cr) {
-      r.saw_cr = false;
-      if (c == '\n') {
-        continue;
+static int fa_modem_rx_header(
+  const uint8_t *buf, size_t len, size_t *payload_start, size_t *nbytes)
+{
+  if (len == 0 || buf[0] != '#') {
+    return -1;
+  }
+  if (len < 2) {
+    return 0;
+  }
+  if (buf[1] == 'B') {
+    if (len < 7) {
+      return 0;
+    }
+    for (size_t i = 2; i < 7; i++) {
+      if (!fa_is_digit(buf[i])) {
+        return -1;
       }
     }
-
-    if (c == '\r') {
-      r.buf[r.len] = '\0';
-      strncpy(out, r.buf, out_sz - 1);
-      out[out_sz - 1] = '\0';
-      r.len = 0;
-      r.saw_cr = true;
-      return true;
+    const int n = fa_digits2(buf, 5, len);
+    *payload_start = 7;
+    *nbytes = (size_t)n;
+    return 1;
+  }
+  if (buf[1] == 'U') {
+    if (len < 4) {
+      return 0;
     }
-
-    if (c == '\n') {
-      r.buf[r.len] = '\0';
-      strncpy(out, r.buf, out_sz - 1);
-      out[out_sz - 1] = '\0';
-      r.len = 0;
-      return true;
+    const int n = fa_digits2(buf, 2, len);
+    if (n < 0) {
+      return -1;
     }
+    *payload_start = 4;
+    *nbytes = (size_t)n;
+    return 1;
+  }
+  return -1;
+}
 
-    if (r.len < LINE_MAX - 1) {
-      r.buf[r.len++] = c;
-    } else {
-      r.len = 0;
-      r.saw_cr = false;
+static void fa_drop_overflow(FrameAssembler &a)
+{
+  a.len = 0;
 #if ENABLE_USB_DEBUG
-      Serial.println("WARN: line overflow, dropped");
+  Serial.println("WARN: frame overflow, dropped");
 #endif
+}
+
+static bool fa_copy_out(
+  const uint8_t *src, size_t n, uint8_t *out, size_t out_sz, size_t *out_len)
+{
+  if (n >= out_sz) {
+    return false;
+  }
+  memcpy(out, src, n);
+  out[n] = 0;
+  *out_len = n;
+  return true;
+}
+
+static bool fa_pop_newline(
+  FrameAssembler &a, uint8_t *out, size_t out_sz, size_t *out_len)
+{
+  size_t nl = a.len;
+  bool found = false;
+  for (size_t i = 0; i < a.len; i++) {
+    if (a.buf[i] == '\n') {
+      nl = i;
+      found = true;
+      break;
     }
   }
+  if (!found) {
+    return false;
+  }
+  size_t n = nl;
+  if (n > 0 && a.buf[n - 1] == '\r') {
+    n--;
+  }
+  const size_t consumed = nl + 1;
+  bool ok = false;
+  if (n > 0) {
+    ok = fa_copy_out(a.buf, n, out, out_sz, out_len);
+  }
+  memmove(a.buf, a.buf + consumed, a.len - consumed);
+  a.len -= consumed;
+  return ok;
+}
 
-  return false;
+// Host TX: $B/$U/$M/$E are complete after the length-prefixed payload.
+// A following CRLF (string-topic writes) is left in the buffer as an empty skip.
+static bool fa_pop_host(
+  FrameAssembler &a, uint8_t *out, size_t out_sz, size_t *out_len)
+{
+  if (a.len == 0) {
+    return false;
+  }
+  size_t payload_start = 0;
+  size_t nbytes = 0;
+  const int hdr = fa_host_tx_header(a.buf, a.len, &payload_start, &nbytes);
+  if (hdr == 0) {
+    return false;
+  }
+  if (hdr == 1) {
+    const size_t need = payload_start + nbytes;
+    if (a.len < need) {
+      return false;
+    }
+    if (!fa_copy_out(a.buf, need, out, out_sz, out_len)) {
+      fa_drop_overflow(a);
+      return false;
+    }
+    memmove(a.buf, a.buf + need, a.len - need);
+    a.len -= need;
+    return true;
+  }
+  return fa_pop_newline(a, out, out_sz, out_len);
+}
+
+// Modem RX: #B/#U consume nn payload bytes, then the ASCII trailer until CRLF.
+static bool fa_pop_modem(
+  FrameAssembler &a, uint8_t *out, size_t out_sz, size_t *out_len)
+{
+  if (a.len == 0) {
+    return false;
+  }
+  size_t payload_start = 0;
+  size_t nbytes = 0;
+  const int hdr = fa_modem_rx_header(a.buf, a.len, &payload_start, &nbytes);
+  if (hdr == 0) {
+    return false;
+  }
+  if (hdr == 1) {
+    const size_t after_payload = payload_start + nbytes;
+    if (a.len < after_payload) {
+      return false;
+    }
+    size_t nl = a.len;
+    bool found = false;
+    for (size_t i = after_payload; i < a.len; i++) {
+      if (a.buf[i] == '\n') {
+        nl = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+    size_t n = nl;
+    if (n > 0 && a.buf[n - 1] == '\r') {
+      n--;
+    }
+    const size_t consumed = nl + 1;
+    if (!fa_copy_out(a.buf, n, out, out_sz, out_len)) {
+      fa_drop_overflow(a);
+      return false;
+    }
+    memmove(a.buf, a.buf + consumed, a.len - consumed);
+    a.len -= consumed;
+    return true;
+  }
+  return fa_pop_newline(a, out, out_sz, out_len);
+}
+
+static void fa_push(FrameAssembler &a, uint8_t b)
+{
+  if (a.len >= LINE_MAX) {
+    fa_drop_overflow(a);
+  }
+  if (a.len < LINE_MAX) {
+    a.buf[a.len++] = b;
+  }
+}
+
+static void host_send_frame(const uint8_t *data, size_t n)
+{
+  if (data == NULL || n == 0) {
+    return;
+  }
+  HOST_SERIAL.write(data, n);
+  HOST_SERIAL.write((uint8_t)'\r');
+  HOST_SERIAL.write((uint8_t)'\n');
+
+#if ENABLE_USB_DEBUG && USB_MIRROR_HOST_OUTPUT
+  Serial.print("HOST SEES: ");
+  Serial.write(data, n);
+  Serial.println();
+#endif
 }
 
 static void host_send_line(const char *line)
 {
-  // send to LoLo
-  HOST_SERIAL.print(line);
-  HOST_SERIAL.print("\r\n");
+  if (line == NULL) {
+    return;
+  }
+  host_send_frame((const uint8_t *)line, strlen(line));
+}
 
-#if ENABLE_USB_DEBUG && USB_MIRROR_HOST_OUTPUT
-  // Marks on the programming side what LoLo sees in case we don't have access to that
-  Serial.print("HOST SEES: ");
-  Serial.println(line);
+static bool frame_as_cstring(
+  const uint8_t *frame, size_t n, char *out, size_t out_sz)
+{
+  if (frame == NULL || out == NULL || n + 1 > out_sz) {
+    return false;
+  }
+  for (size_t i = 0; i < n; i++) {
+    if (frame[i] == 0) {
+      return false;
+    }
+  }
+  memcpy(out, frame, n);
+  out[n] = '\0';
+  return true;
+}
+
+static void modem_send_bytes(const uint8_t *data, size_t n)
+{
+  if (data == NULL || n == 0) {
+    return;
+  }
+  // Succorfish modem commands require no CR/LF terminator. Burst-write so the
+  // inter-byte gap stays under the vendor 2 ms "E" threshold.
+  MODEM_SERIAL.write(data, n);
+  MODEM_SERIAL.flush();
+
+#if ENABLE_USB_DEBUG
+  Serial.print("Sent to Succor: ");
+  Serial.write(data, n);
+  Serial.println();
 #endif
 }
 
 static void modem_send_command_no_terminator(const char *cmd)
 {
-  size_t n = strlen(cmd);
-  if (n == 0) {
+  if (cmd == NULL) {
     return;
   }
-
-  // Succorfish modem commands require no CR/LF terminator
-  MODEM_SERIAL.write((const uint8_t *)cmd, n);
-  MODEM_SERIAL.flush();
-
-#if ENABLE_USB_DEBUG
-  Serial.print("Sent to Succor: ");
-  Serial.println(cmd);
-#endif
+  modem_send_bytes((const uint8_t *)cmd, strlen(cmd));
 }
 
 static void modem_set_address(const char id3[4])
@@ -2625,53 +2847,51 @@ static bool send_timestamped_broadcast(const char *application_payload)
   const int ss = (int)((tx_epoch_second % 60LL + 60LL) % 60LL);
   const char mode = timing_mode_code(timing_mode);
 
-  char payload[MODEM_PAYLOAD_MAX + 1];
-  int payload_len;
+  char header[40];
+  int header_len;
   if (holdover_age_s != 0) {
-    payload_len = snprintf(
-      payload,
-      sizeof(payload),
-      "T%02d|%04X|%c|%08lX|%s",
+    header_len = snprintf(
+      header,
+      sizeof(header),
+      "T%02d|%04X|%c|%08lX|",
       ss,
       (unsigned int)tx_sequence,
       mode,
-      (unsigned long)holdover_age_s,
-      application_payload
+      (unsigned long)holdover_age_s
     );
   } else {
-    payload_len = snprintf(
-      payload,
-      sizeof(payload),
-      "T%02d|%04X|%c|%s",
+    header_len = snprintf(
+      header,
+      sizeof(header),
+      "T%02d|%04X|%c|",
       ss,
       (unsigned int)tx_sequence,
-      mode,
-      application_payload
+      mode
     );
   }
 
-  if (payload_len < 1 ||
-      (size_t)payload_len > MODEM_PAYLOAD_MAX ||
-      (size_t)payload_len >= sizeof(payload)) {
+  const size_t app_len = strlen(application_payload);
+  if (header_len < 1 ||
+      app_len < 1 ||
+      (size_t)header_len + app_len > MODEM_PAYLOAD_MAX) {
     maybe_emit_tx_warning(TX_WARN_PAYLOAD_TOO_LONG);
     return false;
   }
 
-  char cmd[96];
-  const int cmd_len = snprintf(
-    cmd,
-    sizeof(cmd),
-    "$B%02u%s",
-    (unsigned int)payload_len,
-    payload
-  );
+  uint8_t payload[MODEM_PAYLOAD_MAX];
+  memcpy(payload, header, (size_t)header_len);
+  memcpy(payload + header_len, application_payload, app_len);
+  const size_t payload_len = (size_t)header_len + app_len;
 
-  if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+  uint8_t cmd[4 + MODEM_PAYLOAD_MAX];
+  const int cmd_hdr = snprintf((char *)cmd, 5, "$B%02u", (unsigned int)payload_len);
+  if (cmd_hdr != 4) {
     maybe_emit_tx_warning(TX_WARN_PAYLOAD_TOO_LONG);
     return false;
   }
+  memcpy(cmd + 4, payload, payload_len);
 
-  modem_send_command_no_terminator(cmd);
+  modem_send_bytes(cmd, 4 + payload_len);
   tx_sequence++;
   maybe_emit_tx_warning(TX_WARN_NONE);
   return true;
@@ -2786,24 +3006,31 @@ struct TimedPayloadInfo {
 // otherwise places generated prototypes before TimedPayloadInfo is declared.
 static bool parse_timestamp_envelope(
   const char *raw_payload,
+  size_t raw_n,
   TimedPayloadInfo *out);
 
-static bool extract_timed_payload_from_modem_line(
-  const char *line,
+static bool extract_timed_payload_from_modem_frame(
+  const uint8_t *frame,
+  size_t frame_len,
   TimedPayloadInfo *out);
 
 static bool parse_timestamp_envelope(
   const char *raw_payload,
+  size_t raw_n,
   TimedPayloadInfo *out)
 {
-  if (raw_payload == NULL || out == NULL || raw_payload[0] != 'T') {
+  if (raw_payload == NULL || out == NULL || raw_n < 8 || raw_payload[0] != 'T') {
     return false;
   }
 
   // T<ss>|<seq:hex>|<mode>[|<holdover:hex>]|<application>
+  // Application may be GPS, TEL:, or opaque bytes (DCCL). Do not require GPS.
   char *end = NULL;
   const unsigned long ss = strtoul(raw_payload + 1, &end, 10);
   if (end == raw_payload + 1 || end == NULL || *end != '|' || ss > 59UL) {
+    return false;
+  }
+  if ((size_t)(end - raw_payload) >= raw_n) {
     return false;
   }
 
@@ -2812,16 +3039,17 @@ static bool parse_timestamp_envelope(
   if (end == seq_start || end == NULL || *end != '|' || seq > 0xFFFFUL) {
     return false;
   }
+  if ((size_t)(end - raw_payload) >= raw_n) {
+    return false;
+  }
 
   const char *mode_start = end + 1;
-  if ((mode_start[0] != 'P' && mode_start[0] != 'H' && mode_start[0] != 'W') ||
+  if ((size_t)(mode_start - raw_payload) + 2 > raw_n ||
+      (mode_start[0] != 'P' && mode_start[0] != 'H' && mode_start[0] != 'W') ||
       mode_start[1] != '|') {
     return false;
   }
 
-  // Optional holdover field: TX only emits it when free-running (mode H).
-  // Do not probe for it under P/W — GPS payloads start with a hex digit and
-  // must not be mistaken for a holdover age.
   const char *application = mode_start + 2;
   unsigned long tx_holdover_age = 0;
   if (mode_start[0] == 'H') {
@@ -2830,17 +3058,19 @@ static bool parse_timestamp_envelope(
     if (end == age_start || end == NULL || *end != '|') {
       return false;
     }
+    if ((size_t)(end - raw_payload) >= raw_n) {
+      return false;
+    }
     tx_holdover_age = age;
     application = end + 1;
   }
 
-  if (!looks_like_gps_coords(application) &&
-      !looks_like_telemetry(application)) {
+  const size_t app_off = (size_t)(application - raw_payload);
+  if (app_off >= raw_n) {
     return false;
   }
-
-  const size_t n = strlen(application);
-  if (n >= sizeof(out->application_payload)) {
+  const size_t app_n = raw_n - app_off;
+  if (app_n < 1 || app_n >= sizeof(out->application_payload)) {
     return false;
   }
 
@@ -2850,15 +3080,17 @@ static bool parse_timestamp_envelope(
   out->sequence = (uint16_t)seq;
   out->tx_timing_mode = mode_start[0];
   out->tx_holdover_age_s = (uint32_t)tx_holdover_age;
-  memcpy(out->application_payload, application, n + 1);
+  memcpy(out->application_payload, application, app_n);
+  out->application_payload[app_n] = '\0';
   return true;
 }
 
-static bool extract_timed_payload_from_modem_line(
-  const char *line,
+static bool extract_timed_payload_from_modem_frame(
+  const uint8_t *frame,
+  size_t frame_len,
   TimedPayloadInfo *out)
 {
-  if (line == NULL || out == NULL) {
+  if (frame == NULL || out == NULL || frame_len < 4) {
     return false;
   }
 
@@ -2866,44 +3098,40 @@ static bool extract_timed_payload_from_modem_line(
   strcpy(out->source_id, "000");
   char raw_payload[MODEM_PAYLOAD_MAX + 1] = {0};
   size_t n = 0;
-  const char *payload_start = NULL;
+  size_t payload_off = 0;
 
-  // Broadcast: #B<source:3><length:2><payload>...
-  if (line[0] == '#' && line[1] == 'B') {
-    if (!valid_3_digit_id(line + 2) ||
-        !parse_two_digit_len(line + 5, &n)) {
+  if (frame[0] == '#' && frame[1] == 'B') {
+    if (frame_len < 7 ||
+        !valid_3_digit_id((const char *)frame + 2) ||
+        !parse_two_digit_len((const char *)frame + 5, &n)) {
       return false;
     }
-
-    out->source_id[0] = line[2];
-    out->source_id[1] = line[3];
-    out->source_id[2] = line[4];
+    out->source_id[0] = (char)frame[2];
+    out->source_id[1] = (char)frame[3];
+    out->source_id[2] = (char)frame[4];
     out->source_id[3] = '\0';
-    payload_start = line + 7;
-  } else if (line[0] == '#' && line[1] == 'U') {
-    // Unicast: #U<length:2><payload>...
-    if (!parse_two_digit_len(line + 2, &n)) {
+    payload_off = 7;
+  } else if (frame[0] == '#' && frame[1] == 'U') {
+    if (!parse_two_digit_len((const char *)frame + 2, &n)) {
       return false;
     }
-    payload_start = line + 4;
+    payload_off = 4;
   } else {
     return false;
   }
 
-  if (n > MODEM_PAYLOAD_MAX ||
-      strlen(line) < (size_t)(payload_start - line) + n) {
+  if (n > MODEM_PAYLOAD_MAX || frame_len < payload_off + n) {
     return false;
   }
 
-  memcpy(raw_payload, payload_start, n);
+  memcpy(raw_payload, frame + payload_off, n);
   raw_payload[n] = '\0';
 
-  // Only envelope-stamped payloads carry a TX time; untimed payloads do not
-  // produce #I/#J/#OWTT at all.
-  return parse_timestamp_envelope(raw_payload, out);
+  return parse_timestamp_envelope(raw_payload, n, out);
 }
 
-static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
+static void maybe_schedule_round_robin_tx_from_modem_frame(
+  const uint8_t *frame, size_t frame_len)
 {
   if (cfg.mode != MODE_TRANSMITTER) {
     return;
@@ -2913,9 +3141,12 @@ static void maybe_schedule_round_robin_tx_from_modem_line(const char *line)
     return;
   }
 
-  char src_id[4];
+  if (frame == NULL || frame_len < 5) {
+    return;
+  }
 
-  if (!extract_source_id_from_modem_line(line, src_id)) {
+  char src_id[4];
+  if (!extract_source_id_from_modem_line((const char *)frame, src_id)) {
     return;
   }
 
@@ -3011,22 +3242,22 @@ static bool resolve_tx_time_us(
   return true;
 }
 
-static void maybe_emit_receiver_delta_after_modem_line(const char *line)
+static void maybe_emit_receiver_delta_after_modem_frame(
+  const uint8_t *frame, size_t frame_len)
 {
   // Only attempt OWTT on broadcast/unicast data frames.
-  if (line == NULL || line[0] != '#' || (line[1] != 'B' && line[1] != 'U')) {
+  if (frame == NULL || frame_len < 2 ||
+      frame[0] != '#' || (frame[1] != 'B' && frame[1] != 'U')) {
     return;
   }
 
   if (cfg.mode != MODE_RECEIVER) {
-    // #B reached us but we are not in receiver mode — ranging will stay silent.
     host_send_line("#E,I,NOT_R");
     return;
   }
 
   TimedPayloadInfo payload_info = {};
-  if (!extract_timed_payload_from_modem_line(line, &payload_info)) {
-    // Surfaced so a silent parse miss is obvious on the host.
+  if (!extract_timed_payload_from_modem_frame(frame, frame_len, &payload_info)) {
     host_send_line("#E,I,PARSE");
     return;
   }
@@ -3104,11 +3335,16 @@ static void maybe_emit_receiver_delta_after_modem_line(const char *line)
 
   char lat[24] = {0};
   char lon[24] = {0};
-  split_gps_payload(
-    payload_info.application_payload,
-    lat, sizeof(lat),
-    lon, sizeof(lon)
-  );
+  if (looks_like_telemetry(payload_info.application_payload)) {
+    lat[0] = '\0';
+    lon[0] = '\0';
+  } else {
+    split_gps_payload(
+      payload_info.application_payload,
+      lat, sizeof(lat),
+      lon, sizeof(lon)
+    );
+  }
 
   const int64_t tx_ss_time_us =
     (int64_t)payload_info.tx_ss * 1000000LL +
@@ -3575,19 +3811,48 @@ static void check_pending_config_timeout()
   }
 }
 
-static void handle_modem_line(char *line)
+static void handle_host_frame(const uint8_t *frame, size_t n)
 {
+  if (frame == NULL || n == 0) {
+    return;
+  }
+
+  size_t payload_start = 0;
+  size_t nbytes = 0;
+  if (fa_host_tx_header(frame, n, &payload_start, &nbytes) == 1 &&
+      payload_start + nbytes == n) {
+    if (pending_cfg.active) {
+      host_send_line("#E,Y,BUSY");
+      return;
+    }
+    modem_send_bytes(frame, n);
+    return;
+  }
+
+  char line[LINE_MAX];
+  if (!frame_as_cstring(frame, n, line, sizeof(line))) {
+    return;
+  }
+  handle_host_line(line);
+}
+
+static void handle_modem_frame(const uint8_t *frame, size_t n)
+{
+  if (frame == NULL || n == 0) {
+    return;
+  }
+
 #if ENABLE_USB_DEBUG
   Serial.print("Received from Succor: ");
-  Serial.println(line);
+  Serial.write(frame, n);
+  Serial.println();
 #endif
 
-  // Always pass modem response/message to host first.
-  host_send_line(line);
+  host_send_frame(frame, n);
 
-  // If we are waiting for #Axxx/E from the modem, resolve config here
-  // and do not interpret this line as GPS or round-robin data.
-  if (handle_pending_config_modem_line(line)) {
+  char line[LINE_MAX];
+  if (frame_as_cstring(frame, n, line, sizeof(line)) &&
+      handle_pending_config_modem_line(line)) {
     return;
   }
 
@@ -3595,8 +3860,8 @@ static void handle_modem_line(char *line)
     return;
   }
 
-  maybe_emit_receiver_delta_after_modem_line(line);
-  maybe_schedule_round_robin_tx_from_modem_line(line);
+  maybe_emit_receiver_delta_after_modem_frame(frame, n);
+  maybe_schedule_round_robin_tx_from_modem_frame(frame, n);
 }
 
 static void execute_auto_tx_if_due()
@@ -3946,7 +4211,8 @@ void setup()
 
 void loop()
 {
-  char line[LINE_MAX];
+  uint8_t frame[LINE_MAX];
+  size_t n = 0;
 
   // Keep the X20P bridge responsive and passively parse UTC messages.
   service_gnss_bridge();
@@ -3959,14 +4225,28 @@ void loop()
   check_pending_config_timeout();
 
   // Host commands get forwarded immediately and do not wait for PPS.
-  while (read_line(HOST_SERIAL, host_reader, line, sizeof(line))) {
-    handle_host_line(line);
+  while (HOST_SERIAL.available() > 0) {
+    const int b = HOST_SERIAL.read();
+    if (b < 0) {
+      break;
+    }
+    fa_push(host_fa, (uint8_t)b);
+    while (fa_pop_host(host_fa, frame, sizeof(frame), &n)) {
+      handle_host_frame(frame, n);
+    }
   }
 
-  // Modem messages are transparently forwarded first;
-  // receiver then adds #I<delta_t> and, when available, #J<UTC,delta_t>.
-  while (read_line(MODEM_SERIAL, modem_reader, line, sizeof(line))) {
-    handle_modem_line(line);
+  // Modem frames are forwarded first (raw bytes + CRLF); receiver then adds
+  // #I<tof_us> and, when available, #J<UTC,delta_t>.
+  while (MODEM_SERIAL.available() > 0) {
+    const int b = MODEM_SERIAL.read();
+    if (b < 0) {
+      break;
+    }
+    fa_push(modem_fa, (uint8_t)b);
+    while (fa_pop_modem(modem_fa, frame, sizeof(frame), &n)) {
+      handle_modem_frame(frame, n);
+    }
   }
 
   // Service the higher-bandwidth GNSS path again after line processing.
