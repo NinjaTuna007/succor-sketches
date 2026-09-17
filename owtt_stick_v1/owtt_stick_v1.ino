@@ -6,10 +6,10 @@
 //   - Host command "$K<nn><payload>" stores opaque telemetry (length-prefixed
 //     so the payload may contain CR/LF/NUL). ASCII "$K<payload>\\r\\n" still
 //     works when the two bytes after "$K" are not digits.
-//   - It is broadcast as "$BnnTEL:<payload>" on the PPS schedule.
-//   - Receivers treat any broadcast whose payload starts with "TEL:" as a
-//     telemetry frame and still emit an "#I<delta_us>" timing line for it, so
-//     telemetry broadcasts are range-able. See the $K / TEL: notes below.
+//   - The Teensy shunts those bytes on air (timestamp envelope + payload).
+//     It does not prefix TEL: — DCCL id (or ASCII lat,lon) is the type.
+//   - #I is emitted for any timestamped broadcast once UTC is bound, GPS or
+//     opaque. Decoding the application payload is the host's job.
 //
 // UARTS / USB:
 //   Serial1    = Succorfish modem
@@ -74,27 +74,22 @@
 //      byte length of <payload> (same rule as $B). The payload may contain
 //      any byte (DCCL, CRC-8, CR/LF). Not forwarded to the modem.
 //      "$K" is used (not "$T") because "$T" is an existing Succorfish modem
-//      command. Stored/broadcast with a leading "TEL:" marker, i.e.
-//      "$K<nn><payload>" goes out as "$BmmTEL:<payload>".
+//      command. Bytes are stored and broadcast as-is (no TEL: prefix).
 //      ASCII "$K<payload>\\r\\n" is still accepted when the two bytes after
 //      "$K" are not digits.
 //      When telemetry is valid it takes precedence over GPS for the
 //      scheduled broadcast (see below).
 //
 // Automatic transmitter broadcast:
-//   $Bnn<lat>,<lon>           (GPS frame, when no telemetry is set)
-//   $BnnTEL:<payload>         (telemetry frame, when telemetry is set)
+//   $Bnn<envelope><lat>,<lon>     (GPS frame, when no telemetry is set)
+//   $Bnn<envelope><payload>       (telemetry / DCCL, when telemetry is set)
 //      Sent to modem on scheduled PPS/holdover epoch.
 //      nn is the byte length of the broadcast payload (the bytes after nn).
-//      The telemetry frame is identified by a leading "TEL:" marker in the
-//      broadcast payload.
 //
 // Receiver telemetry handling:
-//   A received broadcast whose payload starts with "TEL:" is treated as a
-//   telemetry frame. Just like a GPS frame, the raw modem line is forwarded
-//   to the host first and then a timing line #I<delta_us> is emitted, so
-//   ranges can be derived from telemetry broadcasts. Decoding the telemetry
-//   payload is the host's responsibility.
+//   Any timestamped #B/#U (GPS ASCII or opaque $K bytes) is forwarded to the
+//   host, then #I<tof_us> is emitted when UTC is bound. Decoding DCCL / ASCII
+//   is the host's responsibility. #I does not require a TEL: marker.
 //
 // Receiver timing:
 //   - External 10 MHz OCXO clock into pin 14.
@@ -483,11 +478,10 @@ static uint32_t payload_valid_epochs = 1;
 static uint32_t latest_gps_epoch_count = 0;
 
 // Latest telemetry payload stored on transmitter.
-// Stored WITH the leading "TEL:" frame marker, e.g. "TEL:<encoded...>".
-// The payload after "TEL:" is opaque host-encoded data; the Teensy never
-// parses it. When valid, telemetry takes precedence over GPS for the
-// scheduled broadcast. payload_valid_epochs controls expiry; zero means the
-// stored frame remains valid indefinitely for long experiments.
+// Opaque host bytes (DCCL Pose, BeaconTelemetry, …) with no Teensy prefix.
+// The Teensy never parses them. When valid, telemetry takes precedence over
+// GPS for the scheduled broadcast. payload_valid_epochs controls expiry;
+// zero means the stored frame remains valid indefinitely for long experiments.
 static char latest_telem[GPS_MAX + 1] = {0};
 static size_t latest_telem_len = 0;
 static bool latest_telem_valid = false;
@@ -1069,21 +1063,6 @@ static bool looks_like_gps_coords(const char *s)
   }
 
   return true;
-}
-
-// A telemetry frame is any payload that starts with the "TEL:" marker, e.g.
-// "TEL:<encoded...>". The bytes after "TEL:" are opaque host-encoded data and
-// are not interpreted here. A multi-char marker (vs a bare 'T') makes an
-// accidental collision with ordinary broadcast data far less likely. Require
-// at least one byte after the marker so an empty "TEL:" is not a valid frame.
-static const char TELEMETRY_MARKER[] = "TEL:";
-static const size_t TELEMETRY_MARKER_LEN = 4;
-
-static bool looks_like_telemetry(const char *s)
-{
-  return (s != NULL &&
-          strncmp(s, TELEMETRY_MARKER, TELEMETRY_MARKER_LEN) == 0 &&
-          s[TELEMETRY_MARKER_LEN] != '\0');
 }
 
 static void host_send_config_error(const char *cmd, const char *reason)
@@ -2921,13 +2900,11 @@ static bool update_latest_telemetry_from_host(const char *line)
     return false;
   }
 
-  // User payload follows the "$K" prefix. The broadcast payload is the
-  // "TEL:" marker plus this user data, so its total length is
-  // (un + TELEMETRY_MARKER_LEN).
+  // User payload follows the "$K" prefix. Stored and broadcast as-is.
   const char *user = line + 2;
 
   size_t un = strlen(user);
-  if (un < 1 || (un + TELEMETRY_MARKER_LEN) > GPS_MAX) {
+  if (un < 1 || un > GPS_MAX) {
 #if ENABLE_USB_DEBUG
     Serial.print("WARN: telemetry length invalid: ");
     Serial.println(un);
@@ -2935,10 +2912,9 @@ static bool update_latest_telemetry_from_host(const char *line)
     return true;
   }
 
-  memcpy(latest_telem, TELEMETRY_MARKER, TELEMETRY_MARKER_LEN);
-  memcpy(latest_telem + TELEMETRY_MARKER_LEN, user, un);
-  latest_telem[TELEMETRY_MARKER_LEN + un] = '\0';
-  latest_telem_len = TELEMETRY_MARKER_LEN + un;
+  memcpy(latest_telem, user, un);
+  latest_telem[un] = '\0';
+  latest_telem_len = un;
 
   latest_telem_epoch_count = epoch_count;
   latest_telem_valid = true;
@@ -2957,14 +2933,13 @@ static bool update_latest_telemetry_from_bytes(const uint8_t *user, size_t un)
   if (cfg.mode != MODE_TRANSMITTER) {
     return false;
   }
-  if (user == NULL || un < 1 || (un + TELEMETRY_MARKER_LEN) > GPS_MAX) {
+  if (user == NULL || un < 1 || un > GPS_MAX) {
     return true;
   }
 
-  memcpy(latest_telem, TELEMETRY_MARKER, TELEMETRY_MARKER_LEN);
-  memcpy(latest_telem + TELEMETRY_MARKER_LEN, user, un);
-  latest_telem[TELEMETRY_MARKER_LEN + un] = 0;
-  latest_telem_len = TELEMETRY_MARKER_LEN + un;
+  memcpy(latest_telem, user, un);
+  latest_telem[un] = 0;
+  latest_telem_len = un;
 
   latest_telem_epoch_count = epoch_count;
   latest_telem_valid = true;
@@ -3048,7 +3023,7 @@ static bool parse_timestamp_envelope(
   }
 
   // T<ss>|<seq:hex>|<mode>[|<holdover:hex>]|<application>
-  // Application may be GPS, TEL:, or opaque bytes (DCCL). Do not require GPS.
+  // Application may be GPS ASCII or opaque bytes (DCCL). Do not require GPS.
   char *end = NULL;
   const unsigned long ss = strtoul(raw_payload + 1, &end, 10);
   if (end == raw_payload + 1 || end == NULL || *end != '|' || ss > 59UL) {
@@ -3359,16 +3334,11 @@ static void maybe_emit_receiver_delta_after_modem_frame(
 
   char lat[24] = {0};
   char lon[24] = {0};
-  if (looks_like_telemetry(payload_info.application_payload)) {
-    lat[0] = '\0';
-    lon[0] = '\0';
-  } else {
-    split_gps_payload(
-      payload_info.application_payload,
-      lat, sizeof(lat),
-      lon, sizeof(lon)
-    );
-  }
+  split_gps_payload(
+    payload_info.application_payload,
+    lat, sizeof(lat),
+    lon, sizeof(lon)
+  );
 
   const int64_t tx_ss_time_us =
     (int64_t)payload_info.tx_ss * 1000000LL +
