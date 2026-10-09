@@ -137,6 +137,12 @@
 //   $ZTXWARN=1/0      Enable/disable one-shot TX warnings (default off).
 //   $ZOWTTHEADER?     Reprint the #OWTT CSV column header.
 //   $ZTEMP?           Latest on-die TEMPMON reading as #TEMPMON.
+//   $ZZEROSTART       Bench only. This instant is epoch zero on the OCXO
+//                     counter, unix second 0, holdover ('H'). Pin-40 edges
+//                     are ignored until $ZZEROSTART=OFF, so two boards can
+//                     share the timebase even if one of them has PPS.
+//                     $ZZEROSTART=<unix_s> uses that second.
+//                     $ZZEROSTART? reports.
 //
 // OCXO holdover experiment:
 //   $ZIGNOREPPSAFTER=0    Never ignore PPS (default; all normal sticks).
@@ -157,11 +163,18 @@
 //
 // OCXO rate calibration:
 //   $ZOCXOCAL?        Report the current rate as
-//                       #OCXOCAL,<N|M|F>,<ppb>,<ticks_per_s>,<samples>,<span_s>,<pairs>
+//                       #OCXOCAL,<N|M|F|S>,<ppb>,<ticks_per_s>,<samples>,<span_s>,<pairs>
 //                     N = nominal (no measurement yet), M = measured from PPS,
-//                     F = pinned by command. ppb is the offset from nominal.
+//                     F = pinned by command, S = last measured ppb restored
+//                     from EEPROM (ring still empty). ppb is the offset from
+//                     nominal. A stored offset is kept until a new ring is
+//                     tighter than that store plus datasheet aging (see
+//                     OCXO_AGING_* below). A shorter ring does not replace a
+//                     longer one while the store is still the better bound.
 //   $ZOCXOCAL=AUTO    Resume estimating from PPS (default). Clears the ring and
 //                     falls back to nominal until enough edges accumulate.
+//                     Does not erase the stored ppb; the next boot still
+//                     starts from S.
 //   $ZOCXOCAL=<ppb>   Pin the rate to a known offset and stop estimating, e.g.
 //                     from a previous dive. $ZOCXOCAL=0 pins nominal 1e7 ticks
 //                     per second, reproducing the pre-calibration behaviour for
@@ -215,6 +228,7 @@
 // $G11.2328,12.12385
 
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <ctype.h>
 
 #if !defined(USB_DUAL_SERIAL) && !defined(USB_TRIPLE_SERIAL)
@@ -1179,6 +1193,8 @@ enum TimingMode : uint8_t {
 static char timing_mode_code(TimingMode mode);
 
 static TimingMode timing_mode = TIMING_WAIT_PPS;
+// $ZZEROSTART is running the epoch train. Pin-40 edges are dropped until OFF.
+static bool bench_epoch_active = false;
 
 // Number of OCXO-generated virtual seconds since the last real PPS. Reset to
 // zero on every real PPS.
@@ -1256,7 +1272,8 @@ static int32_t ocxo_rate_ppb = 0;
 enum OcxoCalState : uint8_t {
   OCXO_CAL_NOMINAL  = 0, // no measurement yet, running on EPOCH_TICKS_NOM
   OCXO_CAL_MEASURED = 1, // rate estimated from the PPS ring
-  OCXO_CAL_MANUAL   = 2  // rate pinned by $ZOCXOCAL=<ppb>
+  OCXO_CAL_MANUAL   = 2, // rate pinned by $ZOCXOCAL=<ppb>
+  OCXO_CAL_STORED   = 3  // last measured ppb restored from EEPROM; ring may replace it
 };
 
 static OcxoCalState ocxo_cal_state = OCXO_CAL_NOMINAL;
@@ -1321,7 +1338,8 @@ static void ocxo_apply_rate(uint64_t step_q32, OcxoCalState state)
   ocxo_cal_state = state;
 }
 
-// N = nominal 1e7, M = measured from PPS, F = pinned by $ZOCXOCAL=<ppb>.
+// N = nominal 1e7, M = measured from PPS, F = pinned by $ZOCXOCAL=<ppb>,
+// S = EEPROM restore of the last measured ppb (ring still empty).
 static char ocxo_cal_state_char()
 {
   if (ocxo_cal_state == OCXO_CAL_MEASURED) {
@@ -1330,7 +1348,162 @@ static char ocxo_cal_state_char()
   if (ocxo_cal_state == OCXO_CAL_MANUAL) {
     return 'F';
   }
+  if (ocxo_cal_state == OCXO_CAL_STORED) {
+    return 'S';
+  }
   return 'N';
+}
+
+// Latest measured ppb, the span it was measured over, and the GNSS time.
+// Boot loads the ppb. A new ring replaces it only when its grid is tighter
+// than the stored grid plus Abracon worst-case aging, or when the new span
+// is at least as long (a fresh full ring is today's offset).
+//
+// Abracon AOC2012-Series table (https://abracon.com/datasheets/AOC2012-Series.pdf):
+//   Aging Daily ±1.0 ppb, Aging 1st Year ±100 ppb, Aging 20 Years ±500 ppb.
+// The daily line is the short-term worst case. Integrating ±1 ppb/day with no
+// cap would exceed the yearly and 20-year lines, so the allowance is
+// ceil(age / 1 day) ppb, capped at 100 ppb through the first year and at
+// 500 ppb thereafter. A gap shorter than a day still costs the whole ±1 ppb:
+// the datasheet bounds a day, not an hour. A record with no timestamp is
+// treated as the 20-year worst case, so the first real ring may replace it.
+static constexpr uint32_t OCXO_EEPROM_MAGIC_V1 = 0x4F435831UL; // 'OCX1' ppb only
+static constexpr uint32_t OCXO_EEPROM_MAGIC     = 0x4F435832UL; // 'OCX2'
+static constexpr uint32_t OCXO_AGING_PPB_PER_DAY = 1;
+static constexpr uint32_t OCXO_AGING_YEAR1_PPB   = 100;
+static constexpr uint32_t OCXO_AGING_20Y_PPB     = 500;
+static constexpr uint32_t OCXO_AGING_UNKNOWN_PPB = OCXO_AGING_20Y_PPB;
+static constexpr uint32_t OCXO_EEPROM_FILL_MS = 60000UL;
+static constexpr uint32_t OCXO_EEPROM_FULL_MS = 600000UL;
+static uint32_t ocxo_eeprom_saved_ms = 0;
+static int32_t ocxo_eeprom_saved_ppb = 0;
+static uint32_t ocxo_eeprom_span_s = 0;
+static uint32_t ocxo_eeprom_unix_s = 0;
+static bool ocxo_eeprom_have_saved = false;
+static bool ocxo_eeprom_dirty = false;
+
+struct OcxoEepromRec {
+  uint32_t magic;
+  int32_t ppb;
+  uint32_t span_s;
+  uint32_t unix_s;
+};
+
+static void ocxo_eeprom_remember(int32_t ppb, uint32_t span_s, uint32_t unix_s)
+{
+  ocxo_eeprom_saved_ppb = ppb;
+  ocxo_eeprom_span_s = span_s;
+  ocxo_eeprom_unix_s = unix_s;
+  ocxo_eeprom_have_saved = true;
+}
+
+static void ocxo_eeprom_save()
+{
+  if (ocxo_eeprom_saved_ppb > OCXO_RATE_MAX_PPB ||
+      ocxo_eeprom_saved_ppb < -OCXO_RATE_MAX_PPB) {
+    return;
+  }
+  OcxoEepromRec rec;
+  rec.magic = OCXO_EEPROM_MAGIC;
+  rec.ppb = ocxo_eeprom_saved_ppb;
+  rec.span_s = ocxo_eeprom_span_s;
+  rec.unix_s = ocxo_eeprom_unix_s;
+  EEPROM.put(0, rec);
+  ocxo_eeprom_saved_ms = millis();
+  ocxo_eeprom_dirty = false;
+}
+
+static void ocxo_eeprom_load()
+{
+  OcxoEepromRec rec;
+  EEPROM.get(0, rec);
+  if (rec.magic == OCXO_EEPROM_MAGIC) {
+    if (rec.ppb > OCXO_RATE_MAX_PPB || rec.ppb < -OCXO_RATE_MAX_PPB) {
+      return;
+    }
+    ocxo_apply_rate(ocxo_step_from_ppb(rec.ppb), OCXO_CAL_STORED);
+    ocxo_eeprom_remember(rec.ppb, rec.span_s, rec.unix_s);
+    return;
+  }
+
+  struct OcxoEepromV1 {
+    uint32_t magic;
+    int32_t ppb;
+  } old;
+  EEPROM.get(0, old);
+  if (old.magic != OCXO_EEPROM_MAGIC_V1) {
+    return;
+  }
+  if (old.ppb > OCXO_RATE_MAX_PPB || old.ppb < -OCXO_RATE_MAX_PPB) {
+    return;
+  }
+  // No span and no date. Apply the ppb so boot is not nominal, and let the
+  // first real ring replace it (unknown age == 20-year worst case).
+  ocxo_apply_rate(ocxo_step_from_ppb(old.ppb), OCXO_CAL_STORED);
+  ocxo_eeprom_remember(old.ppb, 0, 0);
+}
+
+// Pair grid in hundredths of a ppb. One 10 MHz tick is 100 ppb over 1 s, and
+// pairs straddle half the stored span, so the grid is 200/span_s ppb.
+static uint32_t ocxo_grid_cppb(uint32_t span_s)
+{
+  if (span_s == 0) {
+    return 0xFFFFFFFFUL;
+  }
+  return (20000UL + span_s - 1U) / span_s;
+}
+
+// Hundredths of a ppb. See OCXO_AGING_* for the datasheet lines.
+static uint32_t ocxo_aging_cppb(uint32_t saved_unix_s, uint32_t now_unix_s)
+{
+  if (saved_unix_s == 0 || now_unix_s == 0 || now_unix_s < saved_unix_s) {
+    return OCXO_AGING_UNKNOWN_PPB * 100U;
+  }
+  const uint32_t age_s = now_unix_s - saved_unix_s;
+  if (age_s == 0) {
+    return 0;
+  }
+  const uint32_t days = (age_s + 86400UL - 1UL) / 86400UL;
+  uint32_t ppb = days * OCXO_AGING_PPB_PER_DAY;
+  if (days <= 365U) {
+    if (ppb > OCXO_AGING_YEAR1_PPB) {
+      ppb = OCXO_AGING_YEAR1_PPB;
+    }
+  } else {
+    ppb = OCXO_AGING_YEAR1_PPB + (days - 365U) * OCXO_AGING_PPB_PER_DAY;
+    if (ppb > OCXO_AGING_20Y_PPB) {
+      ppb = OCXO_AGING_20Y_PPB;
+    }
+  }
+  return ppb * 100U;
+}
+
+static bool ocxo_new_span_wins(uint32_t new_span_s)
+{
+  if (new_span_s == 0) {
+    return false;
+  }
+  if (!ocxo_eeprom_have_saved || ocxo_eeprom_span_s == 0) {
+    return true;
+  }
+  if (new_span_s >= ocxo_eeprom_span_s) {
+    return true;
+  }
+  uint32_t now_unix_s = 0;
+  if (gnss_utc.valid && gnss_utc.unix_second > 0 &&
+      gnss_utc.unix_second <= 0xFFFFFFFFLL) {
+    now_unix_s = (uint32_t)gnss_utc.unix_second;
+  }
+  // No current GNSS time: do not invent an age. A shorter ring stays put.
+  // A stored record with unix 0 is undated; ocxo_aging_cppb treats that as
+  // the 20-year worst case, so a tighter new ring can replace it.
+  if (now_unix_s == 0) {
+    return false;
+  }
+  const uint32_t old_u =
+    ocxo_grid_cppb(ocxo_eeprom_span_s) +
+    ocxo_aging_cppb(ocxo_eeprom_unix_s, now_unix_s);
+  return ocxo_grid_cppb(new_span_s) < old_u;
 }
 
 // MCU junction temperature from the i.MX RT1062 TEMPMON, in centi-degC.
@@ -1518,8 +1691,19 @@ static bool ocxo_cal_try_update()
   if (ppb > OCXO_RATE_MAX_PPB || ppb < -OCXO_RATE_MAX_PPB) {
     return false;
   }
+  if (!ocxo_new_span_wins(ocxo_cal_span_s)) {
+    return false;
+  }
 
   ocxo_apply_rate(step_q32, OCXO_CAL_MEASURED);
+  ocxo_eeprom_saved_ppb = ppb;
+  ocxo_eeprom_span_s = ocxo_cal_span_s;
+  if (gnss_utc.valid && gnss_utc.unix_second > 0 &&
+      gnss_utc.unix_second <= 0xFFFFFFFFLL) {
+    ocxo_eeprom_unix_s = (uint32_t)gnss_utc.unix_second;
+  }
+  ocxo_eeprom_have_saved = true;
+  ocxo_eeprom_dirty = true;
   return true;
 }
 
@@ -1558,6 +1742,18 @@ static void pps_cal_on_real_pps(uint32_t t_epoch)
 
   if (!was_measured || moved >= OCXO_CAL_REPORT_PPB) {
     ocxo_cal_report();
+  }
+
+  if (!ocxo_eeprom_dirty) {
+    return;
+  }
+  const uint32_t min_ms = (pps_cal_count >= PPS_CAL_RING_LEN)
+    ? OCXO_EEPROM_FULL_MS
+    : OCXO_EEPROM_FILL_MS;
+  const bool due = (ocxo_eeprom_saved_ms == 0) ||
+    ((uint32_t)(millis() - ocxo_eeprom_saved_ms) >= min_ms);
+  if (due) {
+    ocxo_eeprom_save();
   }
 }
 
@@ -2475,10 +2671,9 @@ static void process_timing_events()
     pps_pending = false;
     interrupts();
 
-    // Holdover experiment: past the ignore deadline, drop real PPS captures.
-    // last_real_pps_us goes stale and maybe_enter_holdover() below switches
-    // to the OCXO epoch train, exactly like a physical PPS loss.
-    if (!pps_ignored_now()) {
+    // Holdover experiment, or a bench $ZZEROSTART epoch: drop real PPS
+    // captures so the OCXO train keeps the timebase until it is cleared.
+    if (!pps_ignored_now() && !bench_epoch_active) {
       handle_epoch_event(t, true);
     }
   }
@@ -3564,6 +3759,39 @@ static bool handle_gnss_utc_query(const char *line)
   return true;
 }
 
+static void bench_epoch_stop()
+{
+  bench_epoch_active = false;
+  timing_mode = TIMING_WAIT_PPS;
+  pps_valid = false;
+  current_epoch_utc_valid = false;
+  holdover_age_s = 0;
+  tx_auto_due = false;
+  gpt2_disable_compare_irq();
+  noInterrupts();
+  cmp_pending = false;
+  interrupts();
+}
+
+static void bench_epoch_start(int64_t unix_second)
+{
+  const uint32_t now = OCXO_counter_us();
+  noInterrupts();
+  cmp_pending = false;
+  current_epoch_us = now;
+  last_real_pps_us = now;
+  pps_valid = true;
+  current_epoch_utc_second = unix_second;
+  current_epoch_utc_valid = true;
+  timing_mode = TIMING_HOLDOVER;
+  holdover_age_s = 0;
+  bench_epoch_active = true;
+  interrupts();
+  gpt2_schedule_epoch_train(now, 1);
+  gpt2_enable_compare_irq();
+  schedule_first_transmitter_after_config();
+}
+
 static bool handle_experiment_command(const char *line)
 {
   if (line == NULL) {
@@ -3709,6 +3937,51 @@ static bool handle_experiment_command(const char *line)
 
   if (strcmp(line, "$ZOWTTHEADER?") == 0) {
     emit_owtt_csv_header();
+    return true;
+  }
+
+  if (strcmp(line, "$ZZEROSTART?") == 0) {
+    char msg[64];
+    if (!bench_epoch_active) {
+      host_send_line("#ZEROSTART,OFF");
+    } else {
+      snprintf(
+        msg,
+        sizeof(msg),
+        "#ZEROSTART,H,%lld",
+        (long long)current_epoch_utc_second
+      );
+      host_send_line(msg);
+    }
+    return true;
+  }
+
+  if (strcmp(line, "$ZZEROSTART=OFF") == 0) {
+    bench_epoch_stop();
+    host_send_line("#ZEROSTART,OFF");
+    return true;
+  }
+
+  if (strcmp(line, "$ZZEROSTART") == 0 || starts_with(line, "$ZZEROSTART=")) {
+    int64_t unix_second = 0;
+    if (line[11] == '=') {
+      const char *value_text = line + 12;
+      char *end = NULL;
+      unix_second = (int64_t)strtoll(value_text, &end, 10);
+      if (value_text[0] == '\0' || end == NULL || *end != '\0' || unix_second < 0) {
+        host_send_line("#ZEROSTART,ERROR");
+        return true;
+      }
+    }
+    bench_epoch_start(unix_second);
+    char msg[64];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "#ZEROSTART,H,%lld",
+      (long long)unix_second
+    );
+    host_send_line(msg);
     return true;
   }
 
@@ -4178,6 +4451,8 @@ static void sync_owtt_epd_status()
 
 void setup()
 {
+  ocxo_eeprom_load();
+
   // First USB CDC port: LoLo / Succorfish protocol.
   HOST_SERIAL.begin(HOST_BAUD);
 
