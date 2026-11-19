@@ -98,6 +98,11 @@ static uint16_t pps_cal_count = 0;
 
 static uint16_t pps_cal_since_update = 0;
 
+// The 8-edge recompute is O(n) divisions plus an O(n^2) sort. It is flagged
+// on the PPS edge and run from loop() after the modem is keyed, so that
+// time is not added to the one-way flight.
+static bool ocxo_cal_update_due = false;
+
 
 // Scratch for the median. Static rather than automatic: 2 KB does not belong on
 // the main-loop stack.
@@ -428,6 +433,7 @@ void pps_cal_reset()
   pps_cal_head = 0;
   pps_cal_count = 0;
   pps_cal_since_update = 0;
+  ocxo_cal_update_due = false;
   ocxo_cal_span_s = 0;
   ocxo_cal_pairs = 0;
 }
@@ -559,6 +565,17 @@ static void pps_cal_on_real_pps(uint32_t t_epoch)
     return;
   }
   pps_cal_since_update = 0;
+  ocxo_cal_update_due = true;
+}
+
+
+// Pending 8-edge recompute. loop() calls this after execute_auto_tx_if_due().
+void ocxo_cal_service()
+{
+  if (!ocxo_cal_update_due) {
+    return;
+  }
+  ocxo_cal_update_due = false;
 
   const int32_t prev_ppb = ocxo_rate_ppb;
   const bool was_measured = (ocxo_cal_state == OCXO_CAL_MEASURED);

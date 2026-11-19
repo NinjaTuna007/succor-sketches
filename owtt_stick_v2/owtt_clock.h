@@ -12,6 +12,7 @@ void emit_tempmon_line();
 bool sample_die_temp();
 void service_die_temp();
 void ocxo_cal_report();
+void ocxo_cal_service();
 void pps_cal_reset();
 void ocxo_cal_refresh_now();
 uint32_t OCXO_counter_us();

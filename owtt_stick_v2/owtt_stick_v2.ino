@@ -117,6 +117,10 @@ void loop()
   // so manual host commands have priority over scheduled GPS TX.
   execute_auto_tx_if_due();
 
+  // 8-edge OCXO recompute. Flagged from the PPS edge, run only after the
+  // modem has been keyed so the sort is not inside the one-way flight.
+  ocxo_cal_service();
+
   // E-ink status: coalesce full refreshes (see EPD_MIN_REFRESH_MS).
   sync_owtt_epd_status();
   owtt_epd_service();
