@@ -63,6 +63,7 @@ void setup()
   // One line so a bag shows whether the boot probe found the breakout.
   // Absent: no painter thread and no further SPI to the panel.
   host_send_line(owtt_epd_present() ? "#EPD,PRESENT" : "#EPD,ABSENT");
+  host_send_line(OWTT_GPIO_CAPTURE ? "#CAPTURE,GPIO" : "#CAPTURE,GPT2");
 }
 
 

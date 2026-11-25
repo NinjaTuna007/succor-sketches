@@ -17,6 +17,8 @@ Start here, then `owtt_stick_v2.ino`. The command and timing writeup is the comm
 
 The order matters. Timing is latched before serial work so a slow host write cannot move the capture stamp. The stamp itself is taken in the GPT2 interrupt; the loop only reads it.
 
+The GPT2 input-capture unit latches the counter on the PPS edge (pin 40) and the modem receive flag (pin 15). Set `OWTT_GPIO_CAPTURE` to 1 in `owtt_config.h` to read the counter from GPIO edge interrupts on the same pins instead, which adds interrupt latency to both stamps. The board prints `#CAPTURE,GPT2` or `#CAPTURE,GPIO` at boot.
+
 1. `service_gnss_bridge` copies the X20P UART to the second USB port and feeds the UBX parser. The parser does not remove or change any byte.
 2. `process_timing_events` applies a PPS edge, a holdover tick, or a modem receive-flag capture.
 3. Host bytes are assembled and handled immediately. `$Y` configures the board. `$G` and `$K` store a payload. `$Z` is a query. Anything else is forwarded to the modem.

@@ -90,6 +90,13 @@ static constexpr uint8_t PIN_OCXO = 14;
 static constexpr uint8_t PIN_RXS_CAPTURE   = 15;
 static constexpr uint8_t PIN_PPS_CAPTURE   = 40;
 
+// 0: the GPT2 input-capture unit latches the counter on the PPS and RxS edges.
+// 1: GPIO interrupts on the same pins read GPT2_CNT in the ISR instead, so
+//    interrupt entry latency lands in both stamps. For comparing the two.
+#ifndef OWTT_GPIO_CAPTURE
+#define OWTT_GPIO_CAPTURE 0
+#endif
+
 // External 10 MHz clock / (0 + 1) = 10 MHz GPT2 tick (one raw OCXO cycle).
 static constexpr uint32_t GPT2_PRESCALER_VALUE = 0;
 

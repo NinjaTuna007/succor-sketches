@@ -29,6 +29,10 @@ static void handle_epoch_event(uint32_t t_epoch, bool real_pps);
 static uint32_t epoch_ref_for_capture(uint32_t t_capture);
 static void handle_rxs_event(uint32_t t_rxs);
 static void maybe_enter_holdover();
+#if OWTT_GPIO_CAPTURE
+static void rxs_gpio_isr();
+static void pps_gpio_isr();
+#endif
 
 
 // UTC label captured together with pending_delta_us.
@@ -744,6 +748,18 @@ void gpt2_extclk_capture_init()
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
+#if OWTT_GPIO_CAPTURE
+  // Pins 15 and 40 stay GPIO (pinMode in setup); the edge ISRs below read
+  // GPT2_CNT. Same pad settings as the capture path.
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 = 0x13000;
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_04 = 0x13000;
+
+  GPT2_PR = GPT_PR_PRESCALER(GPT2_PRESCALER_VALUE);
+
+  // CLKSRC(3): external clock, FRR: free-running, no input capture.
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
+  GPT2_IR = 0;
+#else
   // Receive Flag capture on pin 15:
   // GPIO_AD_B1_03 -> GPT2_CAPTURE1
   IOMUXC_GPT2_IPP_IND_CAPIN1_SELECT_INPUT = 1;
@@ -768,13 +784,37 @@ void gpt2_extclk_capture_init()
             GPT_CR_IM2(1);
 
   GPT2_IR = GPT_IR_IF1IE | GPT_IR_IF2IE;
+#endif
 
   NVIC_CLEAR_PENDING(IRQ_GPT2);
   attachInterruptVector(IRQ_GPT2, GPT2_IRQHandler);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
   GPT2_CR |= GPT_CR_EN;
+
+#if OWTT_GPIO_CAPTURE
+  attachInterrupt(digitalPinToInterrupt(PIN_RXS_CAPTURE), rxs_gpio_isr, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_PPS_CAPTURE), pps_gpio_isr, RISING);
+#endif
 }
+
+
+#if OWTT_GPIO_CAPTURE
+// The counter is read after interrupt entry and Teensy's GPIO dispatch, so
+// these stamps carry that latency; the capture path above does not.
+static void rxs_gpio_isr()
+{
+  recv_flag_stamp = GPT2_CNT;
+  recv_flag_pending = true;
+}
+
+
+static void pps_gpio_isr()
+{
+  pps_stamp = GPT2_CNT;
+  pps_pending = true;
+}
+#endif
 
 
 extern "C" void GPT2_IRQHandler()
